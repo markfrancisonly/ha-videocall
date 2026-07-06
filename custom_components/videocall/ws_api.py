@@ -420,27 +420,24 @@ async def ws_invite(hass: HomeAssistant, connection, msg: dict) -> None:
     elif target_type == "all":
         notify_services = [m["notify_service"] for m in data.mobile.list_mobile_devices()]
 
-    # If a user's companion app is OPEN (registered as an online endpoint that
-    # this invite already rings in-app), skip the push to that user's phones —
-    # in-app ring is the notification (SPEC §7.1). Push remains the path for
-    # closed apps.
+    # ALWAYS push the resolved phones — never suppress based on whether a
+    # companion endpoint merely "looks" online. A backgrounded or force-quit
+    # iOS app keeps a ZOMBIE websocket, so endpoint.online stays true for the
+    # whole aiohttp heartbeat window (~30-85s, > ring_timeout). The old de-dup
+    # that skipped the push for any user with an "online" companion endpoint
+    # therefore silenced CLOSED iOS phones entirely — no in-app ring (the app
+    # isn't running) and no push. Ringing every device is also correct call
+    # semantics: the shared notification tag is cleared on accept/decline/
+    # timeout (async_clear_ring), so a device that also shows the in-app ring
+    # dismisses its own push the moment the call is answered.
     mobile_user_ids: set[str] = set()
     if notify_services:
         svc_user = {
             m["notify_service"]: m["user_id"]
             for m in data.mobile.list_mobile_devices()
         }
-        companion_user_ids = {
-            t.user_id for t in targets
-            if t.user_id and t.ua_kind.startswith("companion")
-        }
-        if companion_user_ids:
-            notify_services = [
-                s for s in notify_services
-                if svc_user.get(s) not in companion_user_ids
-            ]
-        # users whose phones we push — used for late ring delivery when the
-        # cold-started app registers mid-ring (SPEC §7.2)
+        # users whose phones we push — drives late ring delivery when a
+        # cold-started / reopened app registers mid-ring (SPEC §7.2)
         mobile_user_ids = {
             svc_user[s] for s in notify_services if svc_user.get(s)
         }
@@ -490,6 +487,15 @@ async def ws_invite(hass: HomeAssistant, connection, msg: dict) -> None:
 
     if notify_services:
         await data.mobile.async_send_ring(call, caller.info(), notify_services)
+
+    # observability: a successful invite/push logs nothing otherwise, which
+    # made "closed iOS gets no ring" impossible to see from the logs.
+    _LOGGER.info(
+        "invite %s by %r: ring %d in-app, push %d phone(s)%s",
+        call.call_id[:8], caller.name or caller.client_id[:6],
+        len(targets), len(notify_services),
+        (": " + ", ".join(notify_services)) if notify_services else "",
+    )
 
     # server-side ring timeout (SPEC §5.3). MUST be @callback: async_call_later
     # runs a bare function in the executor thread, and async_end_call touches

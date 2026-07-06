@@ -244,8 +244,15 @@ class MobileRinger:
                 ],
                 # iOS (ignored by Android)
                 "url": answer_uri,
+                # Regular (non-critical) alert with the default notification
+                # sound — no "Critical Alerts" permission required. Kept
+                # `time-sensitive` so an incoming call still surfaces through a
+                # Focus/DND schedule, without the loudness/consent a critical
+                # alert demands. To use a custom ringtone, import a 32-bit-float
+                # 48kHz WAV into the HA iOS app (Settings → Companion App →
+                # Notifications → Sounds) and set "sound" to its filename.
                 "push": {
-                    "sound": {"name": "default", "critical": 0, "volume": 1.0},
+                    "sound": "default",
                     "interruption-level": "time-sensitive",
                 },
             },
