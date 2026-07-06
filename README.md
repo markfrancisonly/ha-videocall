@@ -25,24 +25,38 @@ internet.
   call log), HA events for automations (`videocall_incoming`,
   `videocall_answered`, `videocall_ended`)
 
+
 ## Installation
 
-### HACS (recommended)
+### HACS (Recommended)
 
-1. HACS → menu → **Custom repositories** → add
-   `https://github.com/markfrancisonly/ha-videocall` as *Integration*
-2. Install **Video Call**, restart Home Assistant
-3. Settings → Devices & Services → **Add Integration** → *Video Call*
-   (no questions asked)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=markfrancisonly&repository=ha-videocall&category=integration)
 
-The Lovelace card resource registers itself. Open any dashboard on a device
-and it becomes a callable endpoint.
+Or manually add the custom repository:
 
-### Manual
+<details>
+<summary>Step-by-step HACS installation</summary>
 
-Copy `custom_components/videocall/` into your config's `custom_components/`,
-restart, add the integration.
+1. Open **HACS** in your Home Assistant dashboard
+2. Click the **⋮** menu (top right) → **Custom repositories**
+3. Add this URL and set the category to **Integration**, then click **Add**:
+   ```
+   https://github.com/markfrancisonly/ha-videocall
+   ```
+4. The repository now appears in the custom repositories list. Close the dialog.
+5. Back in HACS, search for **Video Call** and open the result
+6. Click **Download** (or **Install**) and confirm
+7. **Restart Home Assistant**
 
+</details>
+
+### Manual Installation
+
+1. Download the [latest release](https://github.com/markfrancisonly/ha-videocall/releases)
+2. Copy the contents into `custom_components/ha-videocall/` inside your HA config directory
+3. Restart Home Assistant
+
+---
 ## Cards
 
 **Roster card** — pick a Person / Area / Device and call (📹 video, 📞 audio,
