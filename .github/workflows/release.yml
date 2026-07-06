@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+# Needed to CREATE the release and upload the asset.
+# (default GITHUB_TOKEN is read-only on many repos)
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Prepare release asset
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⤵️ Check out code from GitHub
+        uses: actions/checkout@v4
+
+      - name: 🧩 Derive component name (repo name minus optional "ha-" prefix)
+        shell: bash
+        run: |
+          repo="${GITHUB_REPOSITORY##*/}"   # owner/ha-videocall -> ha-videocall
+          component="${repo#ha-}"           # ha-videocall -> videocall (no-op if no prefix)
+          echo "COMPONENT_NAME=${component}" >> "$GITHUB_ENV"
+          echo "📦 Using COMPONENT_NAME=${component}"
+
+      - name: 🔢 Adjust version number to the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"      # e.g. v2026.7.1
+          version="${version,,}"
+          version="${version#v}"
+          manifest="custom_components/${COMPONENT_NAME}/manifest.json"
+          jq --arg version "$version" '.version = $version' "$manifest" > "$manifest.tmp"
+          mv "$manifest.tmp" "$manifest"
+
+      - name: 📦 Create zipped release package
+        shell: bash
+        run: |
+          cd "custom_components/${COMPONENT_NAME}"
+          zip -r "${COMPONENT_NAME}.zip" ./ -x '*.zip'
+
+      - name: 🚀 Create GitHub release and upload zip
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: custom_components/${{ env.COMPONENT_NAME }}/${{ env.COMPONENT_NAME }}.zip
+          generate_release_notes: true

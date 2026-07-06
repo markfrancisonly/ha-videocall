@@ -1,0 +1,15 @@
+{
+  "domain": "videocall",
+  "name": "Video Call",
+  "after_dependencies": ["browser_mod", "mobile_app"],
+  "codeowners": ["@markfrancisonly"],
+  "config_flow": true,
+  "dependencies": ["http", "websocket_api", "person", "lovelace"],
+  "documentation": "https://github.com/markfrancisonly/ha-videocall",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/markfrancisonly/ha-videocall/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "2026.7.1"
+}

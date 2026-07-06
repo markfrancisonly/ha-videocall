@@ -1,0 +1,57 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Video Call",
+        "description": "Set up HA-native video calling. No configuration needed — endpoints, persons and rooms are discovered automatically."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Already configured. Only one instance is allowed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Video Call",
+        "menu_options": {
+          "settings": "Settings",
+          "advanced": "Advanced (ICE / notify overrides)",
+          "prune": "Prune offline endpoints"
+        }
+      },
+      "settings": {
+        "title": "Video Call options",
+        "data": {
+          "turn_host": "TURN server (host or host:port — required for calls across the internet/LTE)",
+          "turn_username": "TURN username",
+          "turn_credential": "TURN credential",
+          "turn_lan_host": "TURN LAN address (optional — lets on-network clients skip NAT hairpin)",
+          "turn_stun": "Use my TURN server for STUN too",
+          "ring_timeout": "Ring timeout (seconds)",
+          "allow_drop_in": "Allow drop-in by default (per-device consent is set on each device's card)",
+          "answer_dashboard": "Dashboard path for mobile Answer deep link"
+        },
+        "data_description": {
+          "turn_stun": "Adds stun: entries for your TURN host(s) so you don't need the Advanced ICE JSON. coturn and most self-hosted TURN servers answer STUN on the same port."
+        }
+      },
+      "advanced": {
+        "title": "Advanced overrides",
+        "data": {
+          "ice_servers": "Extra ICE servers (JSON array of RTCIceServer)",
+          "person_notify_map": "Manual person → notify services map (JSON)"
+        },
+        "data_description": {
+          "ice_servers": "Override the ICE server list. Blank = default STUN (or your \"Use my TURN server for STUN\" setting) plus your TURN. Enter [] for no default ICE servers. Always merged with your TURN settings."
+        }
+      }
+    },
+    "error": {
+      "invalid_json": "Not valid JSON"
+    },
+    "abort": {
+      "pruned": "Removed {count} offline endpoint(s). Online devices were not touched."
+    }
+  }
+}

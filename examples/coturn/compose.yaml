@@ -1,0 +1,35 @@
+# coturn — TURN relay for ha-videocall (calls across the internet/LTE).
+#
+# 1. Copy .env.example → .env and fill in your values.
+# 2. Router port-forwards → this host:
+#      UDP 3478, TCP 3478        (STUN/TURN control)
+#      UDP 49160-49200           (relay range — must match turnserver.conf)
+# 3. docker compose up -d
+# 4. Video Call → Configure → Settings:
+#      TURN server      = your public IP or DNS name
+#      TURN username    = TURN_USER
+#      TURN credential  = TURN_PASSWORD
+#      TURN LAN address = this host's LAN IP (optional, skips NAT hairpin)
+#
+# Host networking: TURN allocates a relay port per session from the range;
+# mapping the range through docker-proxy is wasteful — bind the host stack.
+# (Alternative: a macvlan network with its own IP works equally well.)
+services:
+  coturn:
+    image: coturn/coturn:4-alpine
+    container_name: coturn
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./turnserver.conf:/etc/turnserver.conf:ro
+    command:
+      - -c
+      - /etc/turnserver.conf
+      - --user
+      - ${TURN_USER}:${TURN_PASSWORD}
+      - --external-ip
+      - ${TURN_EXTERNAL_IP}/${TURN_LOCAL_IP}
+      - --listening-ip
+      - ${TURN_LOCAL_IP}
+      - --relay-ip
+      - ${TURN_LOCAL_IP}

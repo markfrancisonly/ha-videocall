@@ -1,0 +1,28 @@
+hangup:
+  name: Hang up
+  description: >-
+    End a call. With no call_id, ends every active/ringing call.
+  fields:
+    call_id:
+      name: Call ID
+      description: Specific call to end (see sensor.videocall_last_call history).
+      required: false
+      selector:
+        text:
+
+prune_endpoints:
+  name: Prune endpoints
+  description: >-
+    Remove devices for browser endpoints that are currently offline (stale
+    kiosks, retired browsers). Online endpoints are never touched.
+  fields:
+    days:
+      name: Days
+      description: Reserved for future last-seen filtering; currently prunes all offline.
+      required: false
+      default: 30
+      selector:
+        number:
+          min: 0
+          max: 365
+          unit_of_measurement: days

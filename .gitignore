@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# secrets / local env
+.env
+**/.env
+!**/.env.example
+
+# local homelab dev tooling (not part of the published integration)
+/install.sh
+/push.sh
+
+# editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+
+# local brand-icon scratch — the SHIPPED set is custom_components/videocall/brand/ (HA 2026.3 Brands Proxy API)
+claude-brand/
+brand - Copy*/
