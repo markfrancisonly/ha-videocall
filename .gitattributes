@@ -1,0 +1,12 @@
+# Normalize text to LF; auto-detect everything else
+* text=auto eol=lf
+
+*.py   text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+
+# Binary — never normalize or diff (protects brand/*.png)
+*.png  binary
