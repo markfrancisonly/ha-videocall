@@ -6,6 +6,11 @@ Home Assistant itself is the signaling server (no cloud, no extra services);
 media flows peer-to-peer, with optional TURN relay for calls across the
 internet.
 
+
+> **Note:** Home Assistant must be accessed over **HTTPS** so browsers
+> can use the camera and microphone. TLS may be provided by Home Assistant
+> itself or by a reverse proxy.
+
 ## Features
 
 - **Call an area** — ring every open browser in a room (wall panels, kiosks)
