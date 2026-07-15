@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.util import slugify
 import voluptuous as vol
 
 from . import ws_api
@@ -324,6 +325,55 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def svc_prune(call: ServiceCall) -> None:
         async_prune_offline_endpoints(hass)
 
+    async def svc_ring(call: ServiceCall) -> None:
+        """Ring a doorbell/intercom to a target (SPEC §14). Everything the
+        client needs to reach go2rtc (webrtc_url, stream) is passed inline —
+        no persistent doorbell registry — so an automation on the Reolink
+        button press is the whole integration surface."""
+        d = call.data
+        doorbell = {
+            "id": d.get("id") or slugify(d["name"]),
+            "name": d["name"],
+            "webrtc_url": d["webrtc_url"],
+            "stream": d["stream"],
+        }
+        for opt in ("token", "talk_stream", "poster"):
+            if d.get(opt):
+                doorbell[opt] = d[opt]
+        if d.get("full_duplex"):
+            doorbell["full_duplex"] = True
+        # camera entity → an instant poster still (SPEC §14 babycam lesson)
+        if not doorbell.get("poster") and d.get("camera_entity"):
+            cam = hass.states.get(d["camera_entity"])
+            pic = cam.attributes.get("entity_picture") if cam else None
+            if pic:
+                doorbell["poster"] = pic
+        area_id = d.get("area_id")
+        if area_id:
+            from homeassistant.helpers import area_registry as ar
+
+            area = ar.async_get(hass).async_get_area(area_id)
+            doorbell["area_id"] = area_id
+            doorbell["area_name"] = area.name if area else None
+        # target: exactly one of person / area / mobile / all
+        if d.get("person"):
+            target = {"type": "person", "id": d["person"]}
+        elif d.get("area"):
+            target = {"type": "area", "id": d["area"]}
+        elif d.get("mobile"):
+            target = {"type": "mobile", "id": str(d["mobile"]).removeprefix("notify.")}
+        elif d.get("all"):
+            target = {"type": "all"}
+        else:
+            _LOGGER.warning("videocall.ring: no target (person/area/mobile/all)")
+            return
+        try:
+            await ws_api.async_ring_doorbell(hass, doorbell, target, d.get("media", "video"))
+        except ValueError:
+            _LOGGER.warning(
+                "videocall.ring %s: no reachable targets for %s", doorbell["name"], target
+            )
+
     hass.services.async_register(
         DOMAIN, "hangup", svc_hangup,
         vol.Schema({vol.Optional("call_id"): str}),
@@ -331,6 +381,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_register(
         DOMAIN, "prune_endpoints", svc_prune,
         vol.Schema({vol.Optional("days", default=30): int}),
+    )
+    hass.services.async_register(
+        DOMAIN, "ring", svc_ring,
+        vol.Schema(
+            {
+                vol.Required("name"): str,
+                vol.Required("webrtc_url"): str,
+                vol.Required("stream"): str,
+                vol.Optional("talk_stream"): str,
+                vol.Optional("full_duplex"): bool,
+                vol.Optional("camera_entity"): str,
+                vol.Optional("poster"): str,
+                vol.Optional("id"): str,
+                vol.Optional("token"): str,
+                vol.Optional("area_id"): str,
+                vol.Optional("media", default="video"): vol.In(["video", "audio"]),
+                vol.Optional("person"): str,
+                vol.Optional("area"): str,
+                vol.Optional("mobile"): str,
+                vol.Optional("all"): bool,
+            }
+        ),
     )
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))

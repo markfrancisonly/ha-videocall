@@ -50,6 +50,14 @@ EVT_CANDIDATE = "candidate"
 EVT_HANGUP = "hangup"
 EVT_ROSTER = "roster"
 
+# --- doorbell / go2rtc intercom (SPEC.md §14) --------------------------------
+# A doorbell is a callable target whose media peer is a go2rtc stream (with a
+# mic backchannel), NOT another browser. The call lifecycle (ring/accept/
+# timeout/hangup/push/overlay) is fully reused; only the media path differs —
+# the answering client negotiates WebRTC directly with go2rtc.
+SVC_RING = "ring"                    # videocall.ring service (doorbell → target)
+DOORBELL_KIND = "doorbell"           # caller_info["kind"] marker for clients
+
 # --- HA bus events (automation surface) --------------------------------------
 BUS_EVT_INCOMING = "videocall_incoming"
 BUS_EVT_ANSWERED = "videocall_answered"

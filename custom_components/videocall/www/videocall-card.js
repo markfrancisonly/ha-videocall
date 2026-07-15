@@ -7,12 +7,12 @@
 //   3. <videocall-card> (+ editor) — Lovelace roster/call UI.
 //
 // COEXISTENCE (SPEC §10 — normative): this file must never collide with the
-// deployed webrtc-babycam / browser-whip-card / browser_mod code. Only these
+// deployed webrtc-babycam / webcam-publisher / browser_mod code. Only these
 // names are ours: videocall-*, window.VideoCallCore, window.__VCALL_VENDOR__,
 // localStorage "vcall:client_id". getUserMedia is NEVER called except on
 // accept (callee gesture) / accepted (caller). Before acquiring the camera we
 // broadcast `camera:claim` (and `camera:release` after) so any other camera
-// user on the page (browser-whip-card, babycam, …) yields it — a generic,
+// user on the page (webcam-publisher, babycam, …) yields it — a generic,
 // cooperative hand-off with no hard dependency on those cards.
 
 (() => {
@@ -32,7 +32,7 @@
   } catch {}
 
   if (window.__VCALL_VENDOR__) return; // idempotent under double resource load
-  const VERSION = "0.13.0";
+  const VERSION = "0.14.5";
   window.__VCALL_VENDOR__ = { version: VERSION };
 
   const LS_CLIENT_ID = "vcall:client_id";
@@ -243,27 +243,28 @@
   };
 
   // ==========================================================================
-  // CameraCoord — generic camera hand-off between cards on the page (SPEC §9.4)
+  // CameraCoord — cooperative camera hand-off between cards on the page (SPEC §9.4)
   //
   // We reference no specific publisher. Before getUserMedia we broadcast
-  // `camera:claim`; any cooperating camera user (browser-whip-card, babycam, …)
-  // stops publishing and sets detail.willRelease so we know to wait out the
-  // device-release latency (Android is slow). Once the line's been idle a beat
-  // we broadcast `camera:release` so they resume. ONE coordinator so
-  // claim/release serialize across back-to-back calls: a new claim CANCELS any
-  // pending release, keeping the publisher down until the line is truly idle
-  // (avoids the old "second call NotReadableError" race). The getUserMedia
-  // retry ladder is the backstop for slow / non-cooperating holders.
+  // `camera:claim` with our id; any cooperating camera holder (webcam-publisher,
+  // babycam, …) releases the device and sets detail.willRelease so we know to wait
+  // out the device-release latency (Android is slow). When done we broadcast
+  // `camera:release` with the SAME id so holders resume (they reference-count
+  // claims by id). ONE coordinator, so a single claim covers back-to-back calls: a
+  // new call CANCELS any pending release, keeping holders down until the line is
+  // truly idle (avoids the old "second call NotReadableError" race). The
+  // getUserMedia retry ladder is the backstop for slow / non-cooperating holders.
   // ==========================================================================
   const CameraCoord = {
+    ID: "videocall", // claim/release identity; holders key their refcount on it
     _claimed: false,
     _timer: null,
     async claim() {
       clearTimeout(this._timer); this._timer = null; // a new call kills any pending release
       if (this._claimed) return;
       this._claimed = true;
-      const ev = new CustomEvent("camera:claim", { detail: { by: "videocall", willRelease: false } });
-      window.dispatchEvent(ev); // cooperating publishers stop synchronously + set willRelease
+      const ev = new CustomEvent("camera:claim", { detail: { id: this.ID, willRelease: false } });
+      window.dispatchEvent(ev); // cooperating holders release synchronously + set willRelease
       if (ev.detail.willRelease) await new Promise((r) => setTimeout(r, 800)); // device release latency
     },
     scheduleRelease() {
@@ -274,16 +275,93 @@
     _release() {
       if (!this._claimed) return;
       this._claimed = false;
-      window.dispatchEvent(new CustomEvent("camera:release", { detail: { by: "videocall" } }));
+      window.dispatchEvent(new CustomEvent("camera:release", { detail: { id: this.ID } }));
     },
   };
+
+  // ==========================================================================
+  // go2rtc WebRTC helpers (SPEC §14). go2rtc signals over a WebSocket
+  // (/api/ws?src=NAME) with trickle ICE — the SAME transport its own web UI
+  // uses, and the only one that carries the mic backchannel for two-way audio.
+  // (The HTTP /api/webrtc endpoint is WHEP-style and receive-only.)
+  // ==========================================================================
+
+  // Derive the go2rtc WS URL from a configured base or /api/webrtc URL.
+  const go2rtcWsUrl = (doorbell) => {
+    let base = String(doorbell.webrtc_url || "").trim().replace(/\/+$/, "");
+    base = base.replace(/\/api\/(webrtc|ws)$/i, "");   // tolerate base | /api/webrtc | /api/ws
+    const q = "src=" + encodeURIComponent(doorbell.stream) +
+      (doorbell.token ? "&access_token=" + encodeURIComponent(doorbell.token) : "");
+    return base.replace(/^http/i, "ws") + "/api/ws?" + q;
+  };
+
+  // Drive an already-built RTCPeerConnection through go2rtc's WS offer/answer +
+  // trickle-candidate exchange (message shapes copied from go2rtc's video-rtc.js:
+  // send {type:'webrtc/offer',value:sdp} and {type:'webrtc/candidate',value:cand};
+  // recv 'webrtc/answer' → setRemoteDescription, 'webrtc/candidate' → addIce with
+  // sdpMid '0'). Returns a handle; .close() ends signaling.
+  const go2rtcNegotiate = (pc, doorbell) => {
+    const ws = new WebSocket(go2rtcWsUrl(doorbell));
+    const handle = { ws, dead: false, close() { this.dead = true; try { ws.close(); } catch {} } };
+    ws.addEventListener("open", async () => {
+      if (handle.dead) return;
+      pc.addEventListener("icecandidate", (e) => {
+        if (handle.dead || ws.readyState !== 1) return;
+        ws.send(JSON.stringify({ type: "webrtc/candidate", value: e.candidate ? e.candidate.candidate : "" }));
+      });
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({ type: "webrtc/offer", value: pc.localDescription.sdp }));
+      } catch (err) { console.warn("[videocall] go2rtc offer failed", err); }
+    });
+    ws.addEventListener("message", (ev) => {
+      if (handle.dead) return;
+      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "webrtc/answer") pc.setRemoteDescription({ type: "answer", sdp: msg.value }).catch(noop);
+      else if (msg.type === "webrtc/candidate") pc.addIceCandidate({ candidate: msg.value, sdpMid: "0" }).catch(noop);
+    });
+    ws.addEventListener("error", () => console.warn("[videocall] go2rtc ws error", go2rtcWsUrl(doorbell)));
+    return handle;
+  };
+
+  // Receive-only go2rtc view (no mic) — the doorbell card's inline live
+  // preview. Independent of the call FSM / overlay, so it never occupies
+  // core.session or blocks a real call. Tapping the preview escalates to the
+  // full two-way intercom (core.callDoorbell) in the overlay.
+  class Go2rtcView {
+    constructor(doorbell, iceServers) {
+      this.doorbell = doorbell;
+      this.iceServers = iceServers || [];
+      this.pc = null;
+      this.g2r = null;
+      this.stream = new MediaStream();
+      this.onstream = null;
+      this._dead = false;
+    }
+    connect() {
+      const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+      this.pc = pc;
+      pc.ontrack = (e) => { this.stream.addTrack(e.track); if (!this._dead) this.onstream?.(this.stream); };
+      try { pc.addTransceiver("video", { direction: "recvonly" }); } catch {}
+      try { pc.addTransceiver("audio", { direction: "recvonly" }); } catch {}
+      this.g2r = go2rtcNegotiate(pc, this.doorbell);
+    }
+    close() {
+      this._dead = true;
+      try { this.g2r?.close(); } catch {}
+      try { this.pc?.close(); } catch {}
+      this.pc = null;
+      try { this.stream.getTracks().forEach((t) => t.stop()); } catch {}
+    }
+  }
 
   // ==========================================================================
   // CallSession — one WebRTC call, client-side FSM (SPEC §5.3/§5.4)
   // states: ringing_in | ringing_out | connecting | active | ended
   // ==========================================================================
   class CallSession {
-    constructor(core, { callId, role, media, peer }) {
+    constructor(core, { callId, role, media, peer, doorbell }) {
       this.core = core;             // VideoCallCore (send/sig access)
       this.callId = callId;
       this.role = role;             // 'caller' | 'callee'
@@ -292,13 +370,30 @@
       this.state = role === "caller" ? "ringing_out" : "ringing_in";
       this.endReason = null;
 
+      // DOORBELL (SPEC §14): the media peer is a go2rtc stream, not a browser.
+      // We send only our mic (talkback → camera backchannel) and receive the
+      // door's video+audio; there is NO SDP relay through HA. The descriptor
+      // ({webrtc_url, stream, …}) arrives with the ring / accept result.
+      this.doorbell = doorbell || null;
+      this.isDoorbell = !!doorbell || peer?.kind === "doorbell";
+      // Half-duplex PUSH-TO-TALK is the doorbell default. A hands-free door
+      // speaker+mic loops your voice back after go2rtc's delay, and browser AEC
+      // cannot cancel that REMOTE acoustic loop (it only cancels your own
+      // speaker→mic echo). PTT — send mic only while held, mute your speaker
+      // while talking — sidesteps it. full_duplex opts into always-open audio
+      // (only sane if the camera has solid onboard AEC).
+      this.pushToTalk = this.isDoorbell && !(doorbell && doorbell.full_duplex);
+      this.talking = false;
+
       this.pc = null;
       this.localStream = null;
       this.remoteStream = new MediaStream();
       this.startedAt = null;
 
-      this.micEnabled = true;
-      this.camEnabled = media === "video";
+      // PTT starts muted — mic transmits only while the talk button is held.
+      this.micEnabled = !this.pushToTalk;
+      // a doorbell intercom never sends outgoing video (mic-only) → no cam
+      this.camEnabled = media === "video" && !this.isDoorbell;
 
       this._timers = new Set();
       this._watchdog = null;
@@ -379,16 +474,107 @@
       this._emit("localstream", this.localStream);
     }
 
+    /** Poor-man's flip camera: cycle the OUTGOING video to the next camera.
+     *  Uses RTCRtpSender.replaceTrack (no SDP renegotiation) and rebuilds
+     *  localStream as a NEW MediaStream so the self-view PiP refreshes. The
+     *  current camera is freed first (phones can't hold two open at once), then
+     *  a strategy ladder is tried — exact deviceId (desktop / modern iOS) →
+     *  facingMode flip (iOS-reliable front/back) — restoring the original if
+     *  every strategy fails. Returns the new label, else null (audio-only /
+     *  single camera / failure). */
+    async cycleCamera() {
+      if (this._cyclingCam || this.media !== "video") return null;
+      const sender = this.pc?.getSenders().find((s) => s.track?.kind === "video");
+      const current = this.localStream?.getVideoTracks()[0];
+      if (!sender || !current) return null;
+      this._cyclingCam = true;
+      const st = current.getSettings();
+      const curId = st.deviceId;
+      const nextFacing = st.facingMode === "environment" ? "user" : "environment";
+      const base = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+      const dead = () => this.state === "ended" || !this.pc || !this.localStream;
+      // getUserMedia with a timeout — a hung capture must not wedge the ladder or
+      // leave _cyclingCam stuck true (and the old camera already stopped) forever
+      const getVideo = (video) => {
+        let timer, timedOut = false;
+        const p = navigator.mediaDevices.getUserMedia({ video, audio: false });
+        p.then((s) => { if (timedOut || dead()) s.getTracks().forEach((t) => t.stop()); }).catch(noop);
+        return Promise.race([
+          p.then((s) => s.getVideoTracks()[0]),
+          new Promise((_, rej) => { timer = setTimeout(() => { timedOut = true; rej(new Error("gUM timeout")); }, GUM_TIMEOUT_MS); }),
+        ]).finally(() => clearTimeout(timer));
+      };
+      // release-settle retry for the RESTORE — Android/WebView frees a camera
+      // slowly, so the second concurrent open can NotReadableError a few times
+      const getVideoRetry = async (video) => {
+        try { return await getVideo(video); }
+        catch { await new Promise((r) => setTimeout(r, 1000));
+          try { return await getVideo(video); }
+          catch { await new Promise((r) => setTimeout(r, 2500)); return await getVideo(video); } }
+      };
+      // install a track — but NEVER into a call that ended during the gUM await
+      const apply = async (track) => {
+        if (dead()) { track.stop(); return false; }
+        track.enabled = this.camEnabled;
+        await sender.replaceTrack(track);
+        this.localStream = new MediaStream([...this.localStream.getAudioTracks(), track]);
+        this._emit("localstream", this.localStream);
+        return true;
+      };
+      try {
+        let cams = [];
+        try {
+          cams = (await navigator.mediaDevices.enumerateDevices())
+            .filter((d) => d.kind === "videoinput");
+        } catch { /* enumerateDevices can throw before permission */ }
+        if (cams.length < 2 || dead()) return null;     // one camera, or call gone
+        const i = cams.findIndex((d) => d.deviceId && d.deviceId === curId);
+        const nextId = cams[((i < 0 ? 0 : i) + 1) % cams.length].deviceId;
+        // free the current camera first — most phones NotReadableError on a
+        // second concurrent open
+        current.stop();
+        try { this.localStream.removeTrack(current); } catch {}
+        const ladder = [
+          { ...base, deviceId: { exact: nextId } },
+          { ...base, facingMode: { exact: nextFacing } },
+          { ...base, facingMode: nextFacing },
+        ];
+        for (const video of ladder) {
+          let t = null;
+          try { t = await getVideo(video); } catch { continue; }
+          if (!t) continue;
+          try { if (await apply(t)) return t.label || "Camera switched"; }
+          catch { /* replaceTrack failed */ }
+          try { t.stop(); } catch {}                    // apply bailed/failed — free it
+          return null;
+        }
+        // every strategy failed — restore the ORIGINAL camera so video flows
+        try {
+          const b = await getVideoRetry(curId ? { ...base, deviceId: { exact: curId } } : base);
+          if (b) {
+            let ok = false;
+            try { ok = await apply(b); } catch {}
+            if (ok) return null;                        // recovered — not frozen
+            try { b.stop(); } catch {}
+          }
+        } catch {}
+        // restore failed too — never leave a STOPPED track frozen on the sender
+        try { await sender.replaceTrack(null); } catch {}
+        this._emit("toast", "Camera switch failed");
+        return null;
+      } catch (e) {
+        console.warn("[videocall] cycleCamera failed", e);
+        return null;
+      } finally {
+        this._cyclingCam = false;
+      }
+    }
+
     // ---- peer connection ------------------------------------------------
 
-    _createPc() {
-      const pc = new RTCPeerConnection({ iceServers: this.core.iceServers || [] });
-      this.pc = pc;
-      pc.onicecandidate = (e) =>
-        this.core._send("videocall/candidate", {
-          call_id: this.callId, client_id: this.core.clientId,
-          candidate: e.candidate ? e.candidate.toJSON() : null,
-        }).catch(noop);
+    // ontrack + connection/ice state wiring shared by the P2P and doorbell
+    // (go2rtc) media paths; only track setup + signaling differ between them.
+    _wireCommon(pc) {
       pc.ontrack = (e) => {
         e.streams[0]?.getTracks().forEach(noop); // ensure stream referenced
         this.remoteStream.addTrack(e.track);
@@ -409,11 +595,121 @@
         }
         // NOTE: 'disconnected' is transient; the stats watchdog catches real death.
       };
+    }
+
+    _createPc() {
+      const pc = new RTCPeerConnection({ iceServers: this.core.iceServers || [] });
+      this.pc = pc;
+      // trickle ICE to the peer via HA relay (browser↔browser only)
+      pc.onicecandidate = (e) =>
+        this.core._send("videocall/candidate", {
+          call_id: this.callId, client_id: this.core.clientId,
+          candidate: e.candidate ? e.candidate.toJSON() : null,
+        }).catch(noop);
+      this._wireCommon(pc);
       this.localStream.getTracks().forEach((t) => pc.addTrack(t, this.localStream));
       if (this.media === "audio") {
         try { pc.addTransceiver("video", { direction: "recvonly" }); } catch {}
       }
       return pc;
+    }
+
+    // ---- doorbell / go2rtc intercom (SPEC §14) --------------------------
+
+    /** Acquire the mic for talkback (never a camera — we don't send video to a
+     *  door). Mic denied → listen-only (recvonly audio), still a useful view. */
+    async _getMicForDoorbell() {
+      await CameraCoord.claim(); // a kiosk WHIP publisher may hold the mic
+      try {
+        this.localStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: { ideal: true }, noiseSuppression: { ideal: true },
+                   autoGainControl: { ideal: true }, channelCount: { ideal: 1 } },
+          video: false,
+        });
+      } catch (e) {
+        this.localStream = null;       // listen-only
+        this.micEnabled = false;
+        this._emit("toast", "Microphone unavailable — listen only");
+      }
+      this._emit("localstream", this.localStream || new MediaStream());
+    }
+
+    /** Build the media leg to go2rtc: mic up (backchannel) + door video/audio
+     *  down. Entry point for both call directions (view-a-door / answer-a-ring). */
+    async _connectDoorbell() {
+      const d = this.doorbell;
+      if (!d) return this.fail("no doorbell descriptor");
+      try {
+        await this._getMicForDoorbell();
+        if (this.state === "ended") return;
+        // Two-stream mode (SPEC §14): a separate `talk_stream` means the mic
+        // rides its OWN go2rtc connection (sendonly → backchannel) while the
+        // door's video+audio come down the receive `stream`. Otherwise the mic
+        // goes up the single receive pc (backchannel on `stream`).
+        const mic = this.localStream?.getAudioTracks()[0];
+        const talkStream = mic && d.talk_stream && d.talk_stream !== d.stream ? d.talk_stream : null;
+
+        // RECEIVE pc — door video + audio. This one drives the call FSM.
+        const pc = new RTCPeerConnection({ iceServers: this.core.iceServers || [] });
+        this.pc = pc;
+        this._wireCommon(pc);
+        // M-LINE SHAPE mirrors go2rtc's OWN client (video-rtc.js): recvonly
+        // video + recvonly audio + the mic as its OWN sendonly m-line. Do NOT
+        // fold the mic into one sendrecv audio line (0.14.3 tried that,
+        // babycam-style): go2rtc pairs its outbound door audio with the
+        // recvonly line, and the sendrecv shape left the browser without an
+        // incoming audio track at all — the silent-tab bug.
+        try { pc.addTransceiver("video", { direction: "recvonly" }); } catch {}
+        try { pc.addTransceiver("audio", { direction: "recvonly" }); } catch {}
+        if (mic && !talkStream) {
+          mic.enabled = this.micEnabled;
+          try { pc.addTransceiver(mic, { direction: "sendonly" }); }
+          catch { try { pc.addTrack(mic, this.localStream); } catch {} }
+        }
+        this._g2r = go2rtcNegotiate(pc, d); // WS offer/answer + trickle
+        this._audioProbe(); // console-logs the layer where audio dies, if it does
+
+        // TALK pc — a second, best-effort sendonly-mic connection to the
+        // backchannel stream. Not wired to the FSM: if talk fails, the call
+        // (video + listen) still stands. The same track is shared, so the mic
+        // toggle mutes both.
+        if (talkStream) {
+          const tpc = new RTCPeerConnection({ iceServers: this.core.iceServers || [] });
+          this.talkPc = tpc;
+          mic.enabled = this.micEnabled;
+          try { tpc.addTransceiver(mic, { direction: "sendonly" }); }
+          catch { try { tpc.addTrack(mic, this.localStream); } catch {} }
+          this._talkG2r = go2rtcNegotiate(tpc, { ...d, stream: talkStream });
+        }
+
+        this._armGuard(SIGNALING_TIMEOUT_MS, "go2rtc connect");
+      } catch (e) {
+        this.fail("doorbell: " + String(e?.message || e));
+      }
+    }
+
+    /** Doorbell-silence triage: periodically logs whether an incoming audio
+     *  TRACK exists (negotiation), whether RTP flows on it (transport), and
+     *  the decoded audioLevel (content) — so a "no sound" report pinpoints
+     *  the failing layer from the browser console alone. */
+    _audioProbe() {
+      let n = 0;
+      const iv = setInterval(async () => {
+        if (!this.pc || this.state === "ended" || ++n > 4) { clearInterval(iv); return; }
+        let rtp = "no inbound-rtp";
+        try {
+          const stats = await this.pc.getStats();
+          stats.forEach((r) => {
+            if (r.type === "inbound-rtp" && (r.kind || r.mediaType) === "audio")
+              rtp = `packets=${r.packetsReceived} level=${r.audioLevel != null ? r.audioLevel.toFixed(3) : "?"}`;
+          });
+        } catch {}
+        const t = this.remoteStream.getAudioTracks()[0];
+        console.info(
+          `[videocall] doorbell audio probe: track=${t ? `${t.readyState}${t.muted ? "/no-rtp" : "/flowing"}` : "NONE"}; ${rtp}`
+        );
+      }, 2500);
+      this._timers.add(iv); // clearTimeout in teardown also clears intervals
     }
 
     _startWatchdog() {
@@ -467,6 +763,14 @@
         if (res?.media && res.media !== this.media) {
           this.media = res.media;
           this.camEnabled = this.media === "video";
+        }
+        // DOORBELL: no peer to exchange SDP with — connect straight to go2rtc.
+        if (res?.doorbell || this.isDoorbell) {
+          this.doorbell = res?.doorbell || this.doorbell;
+          this.isDoorbell = true;
+          this.camEnabled = false;
+          await this._connectDoorbell();
+          return;
         }
         await this._getMedia();
         // the caller's offer may have raced our (slow) media acquisition —
@@ -540,6 +844,17 @@
       this.localStream?.getAudioTracks().forEach((t) => (t.enabled = this.micEnabled));
       this._emit("controls");
     }
+    /** Push-to-talk (doorbell half-duplex): transmit mic only while held, and
+     *  mute our own speaker while talking so the door's delayed echo of our
+     *  own voice is never heard (browser AEC can't cancel that remote loop). */
+    setTalk(on) {
+      if (!this.pushToTalk) return;
+      this.talking = !!on;
+      this.micEnabled = !!on;
+      this.localStream?.getAudioTracks().forEach((t) => (t.enabled = !!on));
+      this._emit("talk", !!on);
+      this._emit("controls");
+    }
     toggleCam() {
       this.camEnabled = !this.camEnabled;
       this.localStream?.getVideoTracks().forEach((t) => (t.enabled = this.camEnabled));
@@ -594,6 +909,12 @@
       this.endReason = reason;
       this._timers.forEach(clearTimeout); this._timers.clear();
       if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null; }
+      try { this._g2r?.close(); } catch {}   // doorbell go2rtc WS signaling
+      this._g2r = null;
+      try { this._talkG2r?.close(); } catch {}   // two-stream mic backchannel WS
+      this._talkG2r = null;
+      try { this.talkPc?.close(); } catch {}
+      this.talkPc = null;
       try { this.pc?.close(); } catch {}
       this.pc = null;
       // NEVER hold the camera after the call (whip-card stop semantics)
@@ -658,6 +979,22 @@
         this.conn.addEventListener("disconnected", () => {
           this.registered = false;
           this._emit("status", "reconnecting…");
+        });
+        // iOS suspends the app when idle; on resume the socket can come back
+        // stale/zombie and the pushed-event subscription is silently dropped, so
+        // a call sets up but the accept/offer/candidate events never arrive and
+        // video never streams — only a full app restart cures it. Re-register on
+        // return to foreground AFTER a real idle gap — but NEVER during a live
+        // call: _register()'s unsubscribe fires the server on_close, which would
+        // end the call and hang up the peer. A genuinely dead socket is still
+        // recovered by the conn "disconnected"→"ready" listener above.
+        let hiddenAt = Date.now();
+        const vdoc = topWindow.document;
+        vdoc.addEventListener("visibilitychange", () => {
+          if (vdoc.visibilityState === "hidden") { hiddenAt = Date.now(); return; }
+          if (Date.now() - hiddenAt <= 4000) return;          // brief switch, skip
+          if (this.session && this.session.state !== "ended") return; // don't disturb a live call
+          this._register().catch(noop);
         });
         await this._register();
       } catch (e) {
@@ -744,6 +1081,7 @@
           }
           this.session = new CallSession(this, {
             callId: evt.call_id, role: "callee", media: evt.media, peer: evt.caller,
+            doorbell: evt.doorbell,   // set → answering connects to go2rtc (§14)
           });
           this._emit("session", this.session);
           if (evt.drop_in && uaKind() !== "companion-ios") {
@@ -817,6 +1155,24 @@
       return this.session;
     }
 
+    /** View + talk to a doorbell/intercom on demand (SPEC §14). No ring and no
+     *  second party — the door "answers" immediately (it's a live go2rtc
+     *  stream). doorbell: {id?, name, webrtc_url, stream, token?}. */
+    async callDoorbell(doorbell, media = "video") {
+      if (this.session && this.session.state !== "ended") throw new Error("already in a call");
+      if (!doorbell?.webrtc_url || !doorbell?.stream) throw new Error("doorbell needs webrtc_url + stream");
+      const callId = uuid();
+      const peer = { name: doorbell.name || "Doorbell", kind: "doorbell" };
+      const s = new CallSession(this, { callId, role: "caller", media, peer, doorbell });
+      s.targetLabel = peer.name;
+      this.session = s;
+      this._emit("session", s);
+      VideocallOverlay.instance().showDoorbell(s); // straight to call UI, no ring
+      s._setState("connecting");
+      s._connectDoorbell();
+      return s;
+    }
+
     _sessionEnded(session) {
       if (this.session === session) {
         this._emit("session", session); // ended state notification
@@ -830,6 +1186,7 @@
       // declined / timeout / deliberate hangups).
       if (
         session.role === "caller" &&
+        !session.isDoorbell &&        // doorbell sessions have no _lastInvite target
         /^error/.test(session.endReason || "") &&
         !/invite failed/.test(session.endReason || "") &&
         this._lastInvite && !this._redialUsed
@@ -930,7 +1287,7 @@ button{border:0;border-radius:50%;cursor:pointer;color:#fff;display:flex;flex-di
 .ctrl.hang{background:#d33}
 video{background:#000;border-radius:12px}
 #remote{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;border-radius:0}
-#local{position:absolute;right:calc(16px + env(safe-area-inset-right,0px));bottom:calc(130px + env(safe-area-inset-bottom,0px));width:22vw;max-width:220px;aspect-ratio:3/4;object-fit:cover;z-index:2;border-radius:14px;box-shadow:0 4px 18px rgba(0,0,0,.5)}
+#local{position:absolute;right:calc(16px + env(safe-area-inset-right,0px));bottom:calc(130px + env(safe-area-inset-bottom,0px));width:26vw;max-width:240px;height:auto;object-fit:cover;z-index:2;border-radius:14px;box-shadow:0 4px 18px rgba(0,0,0,.5);cursor:grab;touch-action:none}
 .callui{display:none;position:absolute;inset:0}
 .callui .bar{position:absolute;bottom:calc(26px + env(safe-area-inset-bottom,0px));left:0;right:0;display:flex;justify-content:center;gap:22px;z-index:3;transition:opacity .3s,transform .3s}
 .dur{position:absolute;top:calc(18px + env(safe-area-inset-top,0px));left:0;right:0;text-align:center;opacity:.85;z-index:3;font-size:17px;transition:opacity .3s}
@@ -942,7 +1299,7 @@ video{background:#000;border-radius:12px}
 /* Minimized: the call shrinks to a floating tile (remote video only); the
    page underneath is fully usable. Tap the tile to restore. Outgoing video
    is turned OFF while minimized (privacy + bandwidth) and restored after. */
-:host(.mini){inset:auto;right:calc(14px + env(safe-area-inset-right,0px));bottom:calc(14px + env(safe-area-inset-bottom,0px));width:200px;height:140px;border-radius:16px;overflow:hidden;box-shadow:0 6px 24px rgba(0,0,0,.55);cursor:pointer}
+:host(.mini){inset:auto;right:calc(14px + env(safe-area-inset-right,0px));bottom:calc(14px + env(safe-area-inset-bottom,0px));width:200px;height:140px;border-radius:16px;overflow:hidden;box-shadow:0 6px 24px rgba(0,0,0,.55);cursor:grab;touch-action:none}
 :host(.mini) .bg{display:none}
 :host(.mini) .bar,:host(.mini) .dur,:host(.mini) #local{display:none!important}
 :host(.mini) #remote{object-fit:cover}
@@ -969,7 +1326,11 @@ video{background:#000;border-radius:12px}
 </div>
 <div class="callui" id="callui">
   <video id="remote" autoplay playsinline></video>
-  <video id="local" autoplay playsinline muted></video>
+  <video id="local" autoplay playsinline muted title="Tap to flip camera · drag to move"></video>
+  <!-- dedicated remote-audio sink: a <video> element plays WebRTC audio
+       unreliably (esp. iOS); the door's audio is routed here for doorbell
+       calls while #remote stays muted (video only) to avoid double audio -->
+  <audio id="rvoice" autoplay playsinline></audio>
   <div class="dur" id="dur"></div>
   <div class="bar">
     <button class="ctrl" id="minb" title="Minimize call"><span>⇲</span><span class="lbl">Minimize</span></button>
@@ -983,13 +1344,92 @@ video{background:#000;border-radius:12px}
       $("rdecline").onclick = () => this._session?.decline();
       $("ocancel").onclick = () => this._session?.cancel();
       $("hang").onclick = () => this._session?.hangup();
-      $("mic").onclick = () => this._session?.toggleMic();
+      // mic button: a plain mute TOGGLE normally; a push-to-talk HOLD for a
+      // half-duplex doorbell (pointer capture keeps transmitting if the finger
+      // slides off the button; release/cancel stops).
+      const micBtn = $("mic");
+      micBtn.onclick = () => { const s = this._session; if (s && !s.pushToTalk) s.toggleMic(); };
+      const talkOn = (e) => {
+        const s = this._session;
+        if (!s?.pushToTalk) return;
+        e.preventDefault();
+        try { micBtn.setPointerCapture(e.pointerId); } catch {}
+        s.setTalk(true);
+      };
+      const talkOff = (e) => {
+        const s = this._session;
+        if (!s?.pushToTalk) return;
+        e.preventDefault();
+        try { micBtn.releasePointerCapture(e.pointerId); } catch {}
+        s.setTalk(false);
+      };
+      micBtn.addEventListener("pointerdown", talkOn);
+      micBtn.addEventListener("pointerup", talkOff);
+      micBtn.addEventListener("pointercancel", talkOff);
       $("cam").onclick = () => this._session?.toggleCam();
-      $("minb").onclick = (e) => { e.stopPropagation(); this._setMini(true); };
-      // tapping the minimized tile restores the full-screen call
-      this.addEventListener("click", () => {
-        if (this.classList.contains("mini")) this._setMini(false);
+      // self-view PiP: a clean TAP flips the camera (poor-man's reverse cam);
+      // a DRAG moves the window. Movement past a small slop = drag (suppress the
+      // flip); pointer-capture keeps the drag smooth if the finger leaves the box.
+      const lv = $("local");
+      let dsx, dsy, dox, doy, dMoved = false, dActive = false;
+      lv.addEventListener("pointerdown", (e) => {
+        if (this.classList.contains("mini")) return;
+        dActive = true; dMoved = false;
+        dsx = e.clientX; dsy = e.clientY;
+        const r = lv.getBoundingClientRect(); dox = r.left; doy = r.top;
+        try { lv.setPointerCapture(e.pointerId); } catch {}
+        e.stopPropagation();                     // don't toggle call chrome
       });
+      lv.addEventListener("pointermove", (e) => {
+        if (!dActive) return;
+        const dx = e.clientX - dsx, dy = e.clientY - dsy;
+        if (!dMoved && Math.hypot(dx, dy) < 6) return;   // still within tap slop
+        dMoved = true;
+        lv.style.cursor = "grabbing";
+        const left = Math.min(Math.max(0, dox + dx), topWindow.innerWidth - lv.offsetWidth);
+        const top = Math.min(Math.max(0, doy + dy), topWindow.innerHeight - lv.offsetHeight);
+        lv.style.left = left + "px"; lv.style.top = top + "px";
+        lv.style.right = "auto"; lv.style.bottom = "auto";
+      });
+      const dEnd = (e) => {
+        if (!dActive) return;
+        dActive = false;
+        lv.style.cursor = "grab";
+        try { lv.releasePointerCapture(e.pointerId); } catch {}
+        if (!dMoved) this._session?.cycleCamera();       // clean tap = flip camera
+      };
+      lv.addEventListener("pointerup", dEnd);
+      lv.addEventListener("pointercancel", dEnd);
+      $("minb").onclick = (e) => { e.stopPropagation(); this._setMini(true); };
+      // Minimized tile: a clean TAP restores the full-screen call; a DRAG moves
+      // the tile out of the way. Inline left/top set here are cleared on restore
+      // (in _setMini) so the restored full-screen UI keeps its inset:0.
+      let msx, msy, mox, moy, mMoved = false, mActive = false;
+      this.addEventListener("pointerdown", (e) => {
+        if (!this.classList.contains("mini")) return;
+        mActive = true; mMoved = false;
+        msx = e.clientX; msy = e.clientY;
+        const r = this.getBoundingClientRect(); mox = r.left; moy = r.top;
+        try { this.setPointerCapture(e.pointerId); } catch {}
+      });
+      this.addEventListener("pointermove", (e) => {
+        if (!mActive) return;
+        const dx = e.clientX - msx, dy = e.clientY - msy;
+        if (!mMoved && Math.hypot(dx, dy) < 6) return;   // still within tap slop
+        mMoved = true; this.style.cursor = "grabbing";
+        const left = Math.min(Math.max(0, mox + dx), topWindow.innerWidth - this.offsetWidth);
+        const top = Math.min(Math.max(0, moy + dy), topWindow.innerHeight - this.offsetHeight);
+        this.style.left = left + "px"; this.style.top = top + "px";
+        this.style.right = "auto"; this.style.bottom = "auto";
+      });
+      const mEnd = (e) => {
+        if (!mActive) return;
+        mActive = false; this.style.cursor = "grab";
+        try { this.releasePointerCapture(e.pointerId); } catch {}
+        if (!mMoved) this._setMini(false);   // clean tap = restore the call
+      };
+      this.addEventListener("pointerup", mEnd);
+      this.addEventListener("pointercancel", mEnd);
 
       // FaceTime-style chrome: controls fade after 4s in-call; tapping the
       // video brings them back (and taps on the bar itself re-arm the timer).
@@ -1016,6 +1456,8 @@ video{background:#000;border-radius:12px}
         this.classList.add("mini");
       } else {
         this.classList.remove("mini");
+        // drop any drag offset from the tile so full-screen reverts to inset:0
+        this.style.left = this.style.top = this.style.right = this.style.bottom = this.style.cursor = "";
         if (this._videoWasOn && s && s.state !== "ended" && !s.camEnabled) s.toggleCam();
         this._videoWasOn = false;
         this._armChromeTimer();
@@ -1076,7 +1518,8 @@ video{background:#000;border-radius:12px}
       const $ = (id) => this.shadowRoot.getElementById(id);
       // "Mark (browser fc9b61)" — who is calling, not just the endpoint
       $("rcaller").textContent = epLabel(session.peer);
-      $("rsub").textContent = `Incoming ${session.media} call`;
+      $("rsub").textContent = session.isDoorbell
+        ? "🔔 At the door" : `Incoming ${session.media} call`;
       this._showPanel("ring");
       this._startTone();
     }
@@ -1106,6 +1549,14 @@ video{background:#000;border-radius:12px}
       this._showPanel("callui");
     }
 
+    /** Doorbell view/answer (SPEC §14): no ring UI — straight to the intercom. */
+    showDoorbell(session) {
+      this._bind(session);
+      const $ = (id) => this.shadowRoot.getElementById(id);
+      $("dur").textContent = `Connecting to ${session.targetLabel || session.peer?.name || "door"}…`;
+      this._showPanel("callui");
+    }
+
     _chime() {
       // one short attention beep (not the repeating ringtone)
       try {
@@ -1121,7 +1572,27 @@ video{background:#000;border-radius:12px}
     _bind(session) {
       this._unbind?.();
       this._session = session;
+      // every call starts full-screen at inset:0 — clear any mini-drag offset
+      // left on the host by a previous (dragged-then-ended) call
+      this.style.left = this.style.top = this.style.right = this.style.bottom = this.style.cursor = "";
       const $ = (id) => this.shadowRoot.getElementById(id);
+      $("dur").textContent = "";     // reset the call timer/label for the new call
+      // a doorbell intercom sends no outgoing video — hide the camera toggle
+      $("cam").style.display = session.isDoorbell ? "none" : "";
+      // babycam lesson: open on an instant still (the browser shows the poster
+      // until real frames decode, then auto-hides it) so the door isn't black
+      // while go2rtc connects. Cleared for non-doorbell calls.
+      $("remote").poster = session.doorbell?.poster || "";
+      // doorbell audio plays via the dedicated #rvoice sink, so keep #remote
+      // (video) muted for doorbell; normal calls play audio on #remote.
+      $("remote").muted = !!session.isDoorbell;
+      $("rvoice").srcObject = null;
+      $("rvoice").muted = false;
+      $("rvoice")._vcTrackId = null;
+      // reset the self-view PiP to its default corner each call (its drag offset
+      // otherwise persists across calls and its clamp goes stale on rotate)
+      const _lv = $("local");
+      _lv.style.left = _lv.style.top = _lv.style.right = _lv.style.bottom = _lv.style.cursor = "";
       const subs = [];
 
       // Local PiP: shown ONLY while outgoing video actually flows — camera off
@@ -1142,6 +1613,9 @@ video{background:#000;border-radius:12px}
           this._stopDurTimer();
           clearTimeout(this._chromeTimer);
           this.classList.remove("mini");
+          // a call that ended while the tile was dragged must not leave the host
+          // offset — the ended-state toast / next call would render shifted
+          this.style.left = this.style.top = this.style.right = this.style.bottom = this.style.cursor = "";
           this._videoWasOn = false;
           this.shadowRoot.getElementById("callui").classList.remove("chrome-hidden");
           // iOS media-session hygiene: fully release the (dead) MediaStreams —
@@ -1149,6 +1623,7 @@ video{background:#000;border-radius:12px}
           // pipeline engaged, which can starve OTHER players (babycam et al).
           $("remote").srcObject = null;
           $("local").srcObject = null;
+          $("rvoice").srcObject = null;
           // Hangup closes IMMEDIATELY — no lingering status screen.
           // Exceptions that DO deserve a brief message: the caller's call was
           // declined, or the media path failed (a silent vanish after a black
@@ -1157,11 +1632,9 @@ video{background:#000;border-radius:12px}
           if (session.role === "caller" && /declined/.test(reason)) {
             this._toast("Call declined");
           } else if (/^error/.test(reason)) {
-            this._toast(
-              /ice|connection|media/.test(reason)
-                ? "Connection failed — media path could not be established"
-                : `Call failed — ${reason.replace(/^error:?\s*/, "")}`,
-            );
+            // Simple, general failure — debug details go to the console/HA logs,
+            // never to the user.
+            this._toast("Couldn't connect the call.", 4000);
           } else {
             this._showPanel(null);
           }
@@ -1172,20 +1645,52 @@ video{background:#000;border-radius:12px}
       // even with the attribute set (babycam-hardened lesson)
       const playSafe = (el) => { try { el.play?.().catch(noop); } catch {} };
       const onLocal = (e) => { $("local").srcObject = e.detail; playSafe($("local")); refreshLocalPip(); };
-      const onRemote = (e) => { $("remote").srcObject = e.detail; playSafe($("remote")); };
+      const onRemote = (e) => {
+        $("remote").srcObject = e.detail; playSafe($("remote"));
+        // doorbell: play the door audio through the dedicated <audio> sink
+        // (#remote stays muted, video only — no double audio). The sink gets an
+        // AUDIO-ONLY stream, (re)attached only once the audio track actually
+        // exists: attaching the mixed stream at first (video-only) ontrack left
+        // the element wedged on a track it can't play — the silent-tab bug.
+        // play() result is logged: NotAllowedError here = autoplay block.
+        if (session.isDoorbell && e.detail) {
+          const rv = $("rvoice");
+          const at = e.detail.getAudioTracks();
+          if (at.length && rv._vcTrackId !== at[0].id) {
+            rv._vcTrackId = at[0].id;
+            rv.srcObject = new MediaStream(at);
+            rv.volume = 1;
+            const p = rv.play?.();
+            p?.then(() => console.info("[videocall] doorbell audio: playing"))
+              .catch((err) => console.warn("[videocall] doorbell audio play FAILED:", err?.name || err));
+          }
+        }
+      };
       const onControls = () => {
-        $("mic").classList.toggle("off", !session.micEnabled);
+        if (session.pushToTalk) {
+          // doorbell PTT: the mic button reads "Hold to talk" / "Talking…"
+          $("mic").classList.toggle("off", session.talking); // red while transmitting
+          $("micico").textContent = session.talking ? "🔴" : "🎤";
+          $("miclbl").textContent = session.talking ? "Talking…" : "Hold to talk";
+        } else {
+          $("mic").classList.toggle("off", !session.micEnabled);
+          $("micico").textContent = session.micEnabled ? "🎙" : "🔇";
+          $("miclbl").textContent = session.micEnabled ? "Mute" : "Unmute";
+        }
         $("cam").classList.toggle("off", !session.camEnabled);
-        $("micico").textContent = session.micEnabled ? "🎙" : "🔇";
-        $("miclbl").textContent = session.micEnabled ? "Mute" : "Unmute";
         $("camico").textContent = session.camEnabled ? "🎥" : "🚫";
         $("camlbl").textContent = session.camEnabled ? "Video off" : "Video on";
         refreshLocalPip();
       };
+      // half-duplex: mute our own speaker while transmitting so the door's
+      // delayed echo of our voice isn't heard
+      // half-duplex: silence our speaker (the door-audio sink) while transmitting
+      const onTalk = (e) => { $("rvoice").muted = !!e.detail; };
       session.events.addEventListener("state", onState); subs.push(["state", onState]);
       session.events.addEventListener("localstream", onLocal); subs.push(["localstream", onLocal]);
       session.events.addEventListener("remotestream", onRemote); subs.push(["remotestream", onRemote]);
       session.events.addEventListener("controls", onControls); subs.push(["controls", onControls]);
+      session.events.addEventListener("talk", onTalk); subs.push(["talk", onTalk]);
       onControls(); // initialize button faces for this session's media/controls
       this._unbind = () => { subs.forEach(([t, h]) => session.events.removeEventListener(t, h)); this._unbind = null; };
     }
@@ -1576,6 +2081,238 @@ icon_height: 40          # glyph size (px), like button card icon_height</pre>
     }
   }
 
+  // ==========================================================================
+  // <videocall-doorbell> — go2rtc doorbell intercom card (SPEC §14, layer 4)
+  //
+  //   type: custom:videocall-doorbell
+  //   name: Front Door
+  //   webrtc_url: https://go2rtc.example/api/webrtc   # go2rtc WebRTC HTTP API
+  //   stream: camera.doorbell_talk                    # stream w/ mic backchannel
+  //   mode: button | preview     # button (default) or inline live preview
+  //   media: video | audio       # default video (the two-way intercom)
+  //   entity: binary_sensor.doorbell_visitor  # optional: pulse while ringing
+  //   token: <bearer>            # optional auth for a protected go2rtc endpoint
+  //   height: 96 / icon_height: 40             # BUTTON-mode sizing
+  //
+  // button:  a tap opens the two-way intercom (view + talk) in the shared
+  //          overlay — this is the "drop in with a button" path.
+  // preview: an inline live view that connects (receive-only, muted) WHEN THE
+  //          CARD SCROLLS INTO VIEW and disconnects when it leaves; tapping it
+  //          escalates to the full two-way intercom in the overlay.
+  //
+  // Either way, the doorbell → phone RING is a separate path: an automation
+  // calls the videocall.ring service on the button press, and the global
+  // overlay answers it like any other call.
+  // ==========================================================================
+  class VideocallDoorbell extends HTMLElement {
+    setConfig(config) {
+      const c = config || {};
+      this._config = c;
+      this._mode = c.mode === "preview" ? "preview" : "button";
+      const slug = (c.name || "doorbell").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+      this._doorbell = {
+        id: c.id || slug || "doorbell",
+        name: c.name || "Doorbell",
+        webrtc_url: c.webrtc_url,
+        stream: c.stream,
+        // optional separate mic backchannel stream (SPEC §14): when the door's
+        // video+audio (playable) and the #backchannel=1 mic path can't live on
+        // one go2rtc stream, receive on `stream` and send mic on `talk_stream`.
+        talk_stream: c.talk_stream,
+        token: c.token,
+        // full_duplex: always-open audio (only if the camera has good AEC);
+        // default is half-duplex push-to-talk.
+        full_duplex: c.full_duplex === true,
+      };
+      // preview may use a lighter stream (e.g. the sub stream) for a faster
+      // first live frame; the intercom always uses the main backchannel stream.
+      this._previewDoorbell = { ...this._doorbell, stream: c.preview_stream || c.stream };
+    }
+    set hass(h) { this._hass = h; if (!this._booted) this._boot(); else { this._reflect(); this._updatePoster(); } }
+    getCardSize() { return this._mode === "preview" ? 4 : 2; }
+    static getConfigElement() { return document.createElement("videocall-doorbell-editor"); }
+    static getStubConfig() {
+      return { name: "Front Door", webrtc_url: "https://go2rtc.example/api/webrtc", stream: "camera.doorbell_talk" };
+    }
+    connectedCallback() {
+      if (!this._booted) return;
+      if (!this._sub) this._subscribe();
+      if (this._mode === "preview") this._observe();
+    }
+    disconnectedCallback() {
+      this._sub?.(); this._sub = null;
+      this._io?.disconnect(); this._io = null;
+      this._stopPreview();
+    }
+    _configured() { return !!(this._doorbell.webrtc_url && this._doorbell.stream); }
+
+    _launch() {
+      if (!this._configured()) { console.warn("[videocall-doorbell] configure webrtc_url + stream"); return; }
+      window.VideoCallCore
+        .callDoorbell({ ...this._doorbell, poster: this._posterUrl() }, this._config.media || "video")
+        .catch((e) => console.warn("[videocall-doorbell] failed:", e?.message || e));
+    }
+
+    _boot() {
+      this._booted = true;
+      this.attachShadow({ mode: "open" });
+      if (this._mode === "preview") this._bootPreview(); else this._bootButton();
+      this._subscribe();
+      this._refresh();
+      this._reflect();
+      this._updatePoster();
+    }
+
+    // babycam lesson: an instant still frame while WebRTC connects. The HA
+    // camera entity's entity_picture is a signed same-origin snapshot URL;
+    // image_url is a plain fallback. Used as the <video poster> (the browser
+    // shows it until real frames decode, then auto-hides it) and passed to the
+    // overlay so the two-way intercom also opens on a frame instead of black.
+    _posterUrl() {
+      const c = this._config;
+      const cam = c.camera_entity || (String(c.entity || "").startsWith("camera.") ? c.entity : null);
+      const st = cam && this._hass?.states?.[cam];
+      return (st && st.attributes && st.attributes.entity_picture) || c.image_url || "";
+    }
+    _updatePoster() {
+      if (this._mode !== "preview") return;
+      const vid = this.shadowRoot?.getElementById("vid");
+      const p = this._posterUrl();
+      if (vid && p && vid.poster !== p) vid.poster = p;
+    }
+
+    _bootButton() {
+      const c = this._config;
+      const cssLen = (v, d) => v == null
+        ? d : (/^\s*\d+(\.\d+)?\s*$/.test(String(v)) ? `${String(v).trim()}px` : String(v));
+      const icoSz = cssLen(c.icon_height, "26px");
+      const hasH = c.height != null && c.height !== "";
+      const hEl = hasH ? "height:auto" : "height:100%";
+      const btnH = hasH ? `height:${cssLen(c.height, "64px")}` : "height:100%;min-height:64px";
+      this.shadowRoot.innerHTML = `
+<style>
+:host{display:block;${hEl}}
+ha-card{${hEl}}
+button{width:100%;${btnH};border:0;border-radius:var(--ha-card-border-radius,12px);cursor:pointer;background:var(--primary-color,#03a9f4);color:#fff;font:600 16px system-ui,sans-serif;display:flex;align-items:center;justify-content:center;gap:10px;padding:12px}
+button[disabled]{opacity:.35;cursor:default}
+button.ringing{background:#d33;animation:vc-pulse 1s ease-in-out infinite}
+@keyframes vc-pulse{50%{opacity:.55}}
+.ico{font-size:${icoSz};line-height:1}
+</style>
+<ha-card><button id="btn"><span class="ico">🔔</span><span>${c.name || "Doorbell"}</span></button></ha-card>`;
+      this.shadowRoot.getElementById("btn").onclick = () => this._launch();
+    }
+
+    _bootPreview() {
+      const c = this._config;
+      this.shadowRoot.innerHTML = `
+<style>
+:host{display:block}
+ha-card{overflow:hidden}
+.pv{position:relative;width:100%;aspect-ratio:16/9;background:#000;cursor:pointer;border-radius:var(--ha-card-border-radius,12px);overflow:hidden}
+.pv.ringing{box-shadow:inset 0 0 0 3px #d33;animation:vc-pulse 1s ease-in-out infinite}
+@keyframes vc-pulse{50%{opacity:.7}}
+video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+.label{position:absolute;top:8px;left:10px;display:flex;align-items:center;gap:6px;font:600 14px system-ui,sans-serif;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.75);z-index:2}
+.hint{position:absolute;bottom:8px;right:10px;font:600 12px system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.5);padding:4px 8px;border-radius:8px;z-index:2}
+.ico{font-size:16px}
+</style>
+<ha-card><div class="pv" id="pv">
+  <video id="vid" autoplay playsinline muted></video>
+  <div class="label"><span class="ico">🔔</span><span>${c.name || "Doorbell"}</span></div>
+  <div class="hint">Tap to talk</div>
+</div></ha-card>`;
+      this.shadowRoot.getElementById("pv").onclick = () => this._launch();
+      this._observe();
+    }
+
+    // Connect the inline preview only while the card is actually on screen —
+    // no wasted go2rtc peer for a card scrolled off the dashboard.
+    _observe() {
+      if (this._mode !== "preview" || this._io || !this.isConnected) return;
+      this._io = new IntersectionObserver((ents) => {
+        this._inView = ents.some((e) => e.isIntersecting && e.intersectionRatio > 0.25);
+        if (this._inView) this._startPreview(); else this._stopPreview();
+      }, { threshold: [0, 0.25, 0.6] });
+      this._io.observe(this);
+    }
+
+    async _startPreview() {
+      if (this._mode !== "preview" || !this._configured() || this._view) return;
+      // never grab the stream while a real overlay call is live (it owns the UI)
+      const s = window.VideoCallCore.session;
+      if (s && s.state !== "ended") return;
+      const view = new Go2rtcView(this._previewDoorbell, window.VideoCallCore.iceServers);
+      this._view = view;
+      const vid = this.shadowRoot.getElementById("vid");
+      view.onstream = (st) => { if (vid) { vid.srcObject = st; try { vid.play?.().catch(noop); } catch {} } };
+      try { view.connect(); }
+      catch (e) { console.warn("[videocall-doorbell] preview failed:", e?.message || e); this._stopPreview(); }
+    }
+    _stopPreview() {
+      const vid = this.shadowRoot?.getElementById("vid");
+      if (vid) vid.srcObject = null;
+      this._view?.close(); this._view = null;
+    }
+
+    _subscribe() {
+      this._sub = window.VideoCallCore.on("session", (s) => {
+        this._refresh();
+        if (this._mode !== "preview") return;
+        // yield the inline preview to a real call; resume when it ends & in view
+        if (s && s.state !== "ended") this._stopPreview();
+        else if (this._inView) this._startPreview();
+      });
+    }
+    _refresh() {
+      const btn = this.shadowRoot?.getElementById("btn");
+      if (!btn) return;                                  // preview mode has no button
+      const s = window.VideoCallCore.session;
+      btn.disabled = !!(s && s.state !== "ended");       // busy while any call is live
+    }
+    // Optional live badge: pulse red while the configured visitor entity is on.
+    _reflect() {
+      const el = this.shadowRoot?.getElementById("pv") || this.shadowRoot?.getElementById("btn");
+      const ent = this._config?.entity;
+      if (!el || !ent || !this._hass?.states) return;
+      const st = this._hass.states[ent];
+      const on = !!st && ["on", "ringing", "detected", "true"].includes(String(st.state));
+      el.classList.toggle("ringing", on);
+    }
+  }
+
+  class VideocallDoorbellEditor extends HTMLElement {
+    setConfig(config) { this._config = { ...config }; this._render(); }
+    set hass(h) {}
+    _render() {
+      if (!this._root) this._root = this.attachShadow({ mode: "open" });
+      this._root.innerHTML = `
+<div style="padding:8px;font:13px system-ui">
+  <p>go2rtc doorbell intercom — tap to view + two-way talk:</p>
+  <pre>name: Front Door
+webrtc_url: https://go2rtc.example/api/webrtc  # go2rtc base (or /api/webrtc) — HTTPS!
+stream: camera.doorbell        # receive: door video + audio (needs OPUS)
+talk_stream: camera.doorbell_talk  # optional: separate #backchannel=1 mic stream
+mode: button | preview         # button (default) or inline live preview
+media: video | audio           # default video
+full_duplex: true              # always-open audio (default: push-to-talk)
+camera_entity: camera.doorbell # poster still while connecting (instant frame)
+image_url: /local/door.jpg     # poster fallback if no camera_entity
+preview_stream: camera.doorbell_sub  # lighter stream for a faster preview frame
+entity: binary_sensor.visitor  # optional: pulse while someone's at the door
+token: &lt;bearer&gt;               # optional go2rtc auth
+height: 96 / icon_height: 40   # button-mode sizing</pre>
+  <p><b>preview</b> connects a muted live view when the card scrolls into view;
+  tap it to talk. <b>button</b> is a launcher. Doorbell talk defaults to
+  half-duplex push-to-talk (hold the 🎤 button) — a hands-free door echoes your
+  voice back after go2rtc's delay, which browser echo-cancellation can't fix;
+  set <code>full_duplex: true</code> only if your camera's own AEC is good.</p>
+  <p>Doorbell → phone ringing is a separate automation that calls the
+  <code>videocall.ring</code> service on the button press.</p>
+</div>`;
+    }
+  }
+
   class VideocallCardEditor extends HTMLElement {
     setConfig(config) { this._config = { ...config }; this._render(); }
     set hass(h) {}
@@ -1597,6 +2334,8 @@ icon_height: 40          # glyph size (px), like button card icon_height</pre>
   if (!customElements.get("videocall-card-editor")) customElements.define("videocall-card-editor", VideocallCardEditor);
   if (!customElements.get("videocall-button")) customElements.define("videocall-button", VideocallButton);
   if (!customElements.get("videocall-button-editor")) customElements.define("videocall-button-editor", VideocallButtonEditor);
+  if (!customElements.get("videocall-doorbell")) customElements.define("videocall-doorbell", VideocallDoorbell);
+  if (!customElements.get("videocall-doorbell-editor")) customElements.define("videocall-doorbell-editor", VideocallDoorbellEditor);
   (window.customCards = window.customCards || []).push(
     {
       type: "videocall-card",
@@ -1607,6 +2346,11 @@ icon_height: 40          # glyph size (px), like button card icon_height</pre>
       type: "videocall-button",
       name: "Video Call Button",
       description: "One-tap call button for a fixed person, area, or device.",
+    },
+    {
+      type: "videocall-doorbell",
+      name: "Video Call Doorbell",
+      description: "go2rtc doorbell intercom: view + two-way talk, and answer doorbell rings.",
     },
   );
 

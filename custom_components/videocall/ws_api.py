@@ -23,6 +23,7 @@ from .const import (
     BUS_EVT_ANSWERED,
     BUS_EVT_ENDED,
     BUS_EVT_INCOMING,
+    DOORBELL_KIND,
     DOMAIN,
     EVT_ACCEPTED,
     EVT_ANSWER,
@@ -177,6 +178,41 @@ def _person_user_id(hass: HomeAssistant, person_entity_id: str) -> str | None:
     return state.attributes.get("user_id") if state else None
 
 
+def _resolve_ring(
+    hass: HomeAssistant, target_type: str, target_id: str | None, exclude: str = "",
+):
+    """Resolve a target to (online endpoints, phone notify services, pushed
+    user_ids, person_user_id). Shared by the browser invite (§5.1) and the
+    doorbell ring (§14) so both fan out identically."""
+    data = _data(hass)
+    person_user_id = None
+    if target_type == "person":
+        person_user_id = _person_user_id(hass, target_id or "")
+
+    targets = data.endpoints.resolve_targets(
+        target_type, target_id, exclude=exclude, person_user_id=person_user_id,
+    )
+
+    # mobile push per target type (SPEC §7.1) — reachable with the app CLOSED.
+    notify_services: list[str] = []
+    if target_type == "person" and target_id:
+        notify_services = data.mobile.resolve_notify_services(target_id)
+    elif target_type == "mobile" and target_id:
+        notify_services = data.mobile.validate_services([target_id])
+    elif target_type == "area" and target_id:
+        notify_services = data.mobile.services_for_area(target_id)
+    elif target_type == "all":
+        notify_services = [m["notify_service"] for m in data.mobile.list_mobile_devices()]
+
+    mobile_user_ids: set[str] = set()
+    if notify_services:
+        svc_user = {
+            m["notify_service"]: m["user_id"] for m in data.mobile.list_mobile_devices()
+        }
+        mobile_user_ids = {svc_user[s] for s in notify_services if svc_user.get(s)}
+    return targets, notify_services, mobile_user_ids, person_user_id
+
+
 def async_end_call(hass: HomeAssistant, call: Call, reason: EndReason) -> None:
     """Single exit point: notify parties/ringers, clear mobile, log, bus event."""
     data = _data(hass)
@@ -232,6 +268,111 @@ def async_fail_endpoint_calls(hass: HomeAssistant, client_id: str, reason: EndRe
             call.ringing.discard(client_id)
             if call.all_declined():
                 async_end_call(hass, call, EndReason.DECLINED)
+
+
+# --------------------------------------------------------------------------
+# doorbell ring (SPEC §14) — synthetic caller, go2rtc media peer
+# --------------------------------------------------------------------------
+
+def _doorbell_caller_info(doorbell: dict) -> dict:
+    """EndpointInfo-shaped identity for a doorbell (no registered endpoint).
+    `kind: doorbell` tells the client to connect its media to go2rtc instead
+    of awaiting a peer offer."""
+    return {
+        "endpoint_id": f"doorbell:{doorbell['id']}",
+        "client_id": f"doorbell:{doorbell['id']}",
+        "name": doorbell.get("name") or "Doorbell",
+        "area_id": doorbell.get("area_id"),
+        "area_name": doorbell.get("area_name"),
+        "ua_kind": DOORBELL_KIND,
+        "user_id": None,
+        "user_name": None,
+        "kind": DOORBELL_KIND,
+        "online": True,
+        "in_call": False,
+    }
+
+
+async def async_ring_doorbell(
+    hass: HomeAssistant, doorbell: dict, target: dict, media: str = "video",
+) -> dict:
+    """Ring a doorbell to a target (person/area/mobile/all). Reuses the whole
+    ring fan-out (in-app ring + mobile push + timeout); the accepting client
+    then connects its media directly to go2rtc using `doorbell`. Raises
+    ValueError('no_targets') when nothing is reachable."""
+    data = _data(hass)
+    target_type = target["type"]
+    target_id = target.get("id")
+    targets, notify_services, mobile_user_ids, _ = _resolve_ring(
+        hass, target_type, target_id,
+    )
+    if not targets and not notify_services:
+        raise ValueError("no_targets")
+
+    caller_info = _doorbell_caller_info(doorbell)
+    call = data.calls.create(
+        Call(
+            call_id=uuid.uuid4().hex,
+            caller_id=caller_info["client_id"],  # synthetic; not in the registry
+            media=media,
+            target_type=target_type,
+            target_id=target_id,
+            ringing={t.client_id for t in targets},
+            mobile_pending=len(notify_services),
+            mobile_notify_services=notify_services,
+            mobile_user_ids=mobile_user_ids,
+            caller_info=caller_info,
+            doorbell=doorbell,
+        )
+    )
+
+    for t in targets:
+        t.call_id = call.call_id  # busy-guarded while ringing
+        _push(t, EVT_RING, {
+            "call_id": call.call_id,
+            "media": call.media,
+            "caller": caller_info,
+            "target_type": target_type,
+            "drop_in": False,
+            "doorbell": doorbell,
+        })
+        async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, t.client_id)
+
+    if notify_services:
+        await data.mobile.async_send_ring(call, caller_info, notify_services)
+
+    _LOGGER.info(
+        "doorbell ring %s (%s): %d in-app, %d phone(s)",
+        call.call_id[:8], doorbell.get("name"), len(targets), len(notify_services),
+    )
+
+    @callback
+    def _timeout(_now) -> None:
+        data.ring_timeouts.pop(call.call_id, None)
+        if call.state is CallState.RINGING:
+            async_end_call(hass, call, EndReason.TIMEOUT)
+
+    data.ring_timeouts[call.call_id] = async_call_later(hass, data.ring_timeout, _timeout)
+
+    hass.bus.async_fire(
+        BUS_EVT_INCOMING,
+        {
+            "call_id": call.call_id,
+            "media": call.media,
+            "drop_in": False,
+            "caller": caller_info,
+            "doorbell": doorbell,
+            "target_type": target_type,
+            "target_id": target_id,
+            "ringing": sorted(call.ringing),
+            "mobile_notified": notify_services,
+        },
+    )
+    return {
+        "call_id": call.call_id,
+        "ringing": sorted(call.ringing),
+        "mobile_notified": notify_services,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -353,9 +494,11 @@ async def ws_register(hass: HomeAssistant, connection, msg: dict) -> None:
             _push(endpoint, EVT_RING, {
                 "call_id": ringing_call.call_id,
                 "media": ringing_call.media,
-                "caller": caller_ep.info() if caller_ep else {},
+                # doorbell calls have no caller endpoint — fall back to caller_info
+                "caller": caller_ep.info() if caller_ep else (ringing_call.caller_info or {}),
                 "target_type": ringing_call.target_type,
                 "drop_in": False,
+                "doorbell": ringing_call.doorbell,
             })
             async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, endpoint.client_id)
             break
@@ -396,51 +539,19 @@ async def ws_invite(hass: HomeAssistant, connection, msg: dict) -> None:
     # normally instead of auto-answering — the call always goes through.
     drop_in = msg["drop_in"]
 
+    # ALWAYS push the resolved phones (inside _resolve_ring) — never suppress
+    # based on whether a companion endpoint merely "looks" online. A
+    # backgrounded or force-quit iOS app keeps a ZOMBIE websocket, so
+    # endpoint.online stays true for the whole aiohttp heartbeat window
+    # (~30-85s, > ring_timeout); the shared notification tag is cleared on
+    # accept/decline/timeout so a device also showing the in-app ring dismisses
+    # its own push the moment the call is answered.
     target = msg["target"]
     target_type = target["type"]
     target_id = target.get("id")
-    person_user_id = None
-    if target_type == "person":
-        person_user_id = _person_user_id(hass, target_id or "")
-
-    targets = data.endpoints.resolve_targets(
-        target_type, target_id, exclude=caller.client_id,
-        person_user_id=person_user_id,
+    targets, notify_services, mobile_user_ids, person_user_id = _resolve_ring(
+        hass, target_type, target_id, exclude=caller.client_id,
     )
-
-    # mobile push per target type (SPEC §7.1). Phones are reachable with the
-    # app CLOSED — push is never gated on a registered endpoint.
-    notify_services: list[str] = []
-    if target_type == "person" and target_id:
-        notify_services = data.mobile.resolve_notify_services(target_id)
-    elif target_type == "mobile" and target_id:
-        notify_services = data.mobile.validate_services([target_id])
-    elif target_type == "area" and target_id:
-        notify_services = data.mobile.services_for_area(target_id)
-    elif target_type == "all":
-        notify_services = [m["notify_service"] for m in data.mobile.list_mobile_devices()]
-
-    # ALWAYS push the resolved phones — never suppress based on whether a
-    # companion endpoint merely "looks" online. A backgrounded or force-quit
-    # iOS app keeps a ZOMBIE websocket, so endpoint.online stays true for the
-    # whole aiohttp heartbeat window (~30-85s, > ring_timeout). The old de-dup
-    # that skipped the push for any user with an "online" companion endpoint
-    # therefore silenced CLOSED iOS phones entirely — no in-app ring (the app
-    # isn't running) and no push. Ringing every device is also correct call
-    # semantics: the shared notification tag is cleared on accept/decline/
-    # timeout (async_clear_ring), so a device that also shows the in-app ring
-    # dismisses its own push the moment the call is answered.
-    mobile_user_ids: set[str] = set()
-    if notify_services:
-        svc_user = {
-            m["notify_service"]: m["user_id"]
-            for m in data.mobile.list_mobile_devices()
-        }
-        # users whose phones we push — drives late ring delivery when a
-        # cold-started / reopened app registers mid-ring (SPEC §7.2)
-        mobile_user_ids = {
-            svc_user[s] for s in notify_services if svc_user.get(s)
-        }
 
     if not targets and not notify_services:
         if target_type == "person":
@@ -612,11 +723,16 @@ def ws_accept(hass: HomeAssistant, connection, msg: dict) -> None:
 
     async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, callee.client_id)
     # media/caller in the result let a late-joining endpoint (deep link, no
-    # ring event ever received) build its session from the accept alone.
-    connection.send_result(
-        msg["id"],
-        {"caller": caller.info() if caller else None, "media": call.media},
-    )
+    # ring event ever received) build its session from the accept alone. For a
+    # doorbell (SPEC §14) there is no caller endpoint — caller_info + doorbell
+    # give the callee everything it needs to connect its media to go2rtc.
+    result = {
+        "caller": caller.info() if caller else call.caller_info,
+        "media": call.media,
+    }
+    if call.doorbell:
+        result["doorbell"] = call.doorbell
+    connection.send_result(msg["id"], result)
 
 
 @websocket_api.websocket_command(

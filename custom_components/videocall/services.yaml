@@ -10,6 +10,118 @@ hangup:
       selector:
         text:
 
+ring:
+  name: Ring doorbell / intercom
+  description: >-
+    Ring a go2rtc-backed doorbell to a person, area, or all phones. Call this
+    from an automation on the doorbell button press. Whoever answers connects
+    two-way audio+video directly to go2rtc (mic → camera backchannel); no other
+    party is needed. Provide exactly one of person/area/mobile/all.
+  fields:
+    name:
+      name: Name
+      description: Display name shown on the incoming call ("Front Door").
+      required: true
+      example: Front Door
+      selector:
+        text:
+    webrtc_url:
+      name: go2rtc WebRTC URL
+      description: >-
+        HTTPS endpoint of the go2rtc WebRTC API (the client POSTs the SDP
+        offer here). Must be HTTPS (browser mic + no mixed content).
+      required: true
+      example: https://go2rtc.example.com/api/webrtc
+      selector:
+        text:
+    stream:
+      name: go2rtc stream
+      description: >-
+        go2rtc stream to RECEIVE (door video + audio). Needs a browser-playable
+        audio codec (Opus) — add an ffmpeg:...#audio=opus source if the camera
+        is AAC. If this stream also has #backchannel=1, mic talk works on it too.
+      required: true
+      example: camera.doorbell
+      selector:
+        text:
+    talk_stream:
+      name: Talk (backchannel) stream
+      description: >-
+        Optional separate go2rtc stream (#backchannel=1) for the mic path, when
+        receive audio and the backchannel can't share one stream. Mic rides its
+        own connection to this stream.
+      required: false
+      example: camera.doorbell_talk
+      selector:
+        text:
+    full_duplex:
+      name: Full-duplex audio
+      description: >-
+        Always-open two-way audio. Default is half-duplex push-to-talk, which
+        avoids the doorbell echoing your voice back over go2rtc's delay. Only
+        enable if the camera has good onboard echo cancellation.
+      required: false
+      selector:
+        boolean:
+    camera_entity:
+      name: Camera entity (poster)
+      description: HA camera whose snapshot is shown as an instant still while connecting.
+      required: false
+      selector:
+        entity:
+          domain: camera
+    poster:
+      name: Poster URL
+      description: Explicit still-image URL shown while connecting (overrides camera_entity).
+      required: false
+      selector:
+        text:
+    person:
+      name: Person
+      description: Ring this person (their browsers + phones). One target only.
+      required: false
+      selector:
+        entity:
+          domain: person
+    area:
+      name: Area
+      description: Ring browsers/phones in this area. One target only.
+      required: false
+      selector:
+        area:
+    mobile:
+      name: Mobile notify service
+      description: Ring one phone by its notify service (mobile_app_x). One target only.
+      required: false
+      selector:
+        text:
+    all:
+      name: All phones
+      description: Ring every companion phone. One target only.
+      required: false
+      selector:
+        boolean:
+    media:
+      name: Media
+      description: video (default) or audio-only.
+      required: false
+      default: video
+      selector:
+        select:
+          options: [video, audio]
+    token:
+      name: Bearer token
+      description: Optional Authorization bearer for a protected go2rtc endpoint.
+      required: false
+      selector:
+        text:
+    id:
+      name: ID
+      description: Stable id for the doorbell (defaults to a slug of the name).
+      required: false
+      selector:
+        text:
+
 prune_endpoints:
   name: Prune endpoints
   description: >-

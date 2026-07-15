@@ -175,6 +175,12 @@ class Call:
     caller_id: str                          # client_id
     media: str = "video"                    # video | audio
     drop_in: bool = False                   # auto-answer invite (SPEC §5.4a)
+    # SPEC §14 — doorbell/go2rtc intercom. When set, the caller is NOT a
+    # registered endpoint: caller_info holds its wire identity, and `doorbell`
+    # is the go2rtc descriptor {id, name, webrtc_url, stream, …} the accepting
+    # client uses to connect its media directly to go2rtc (no SDP relay).
+    caller_info: dict | None = None
+    doorbell: dict | None = None
     target_type: str = "endpoint"
     target_id: str | None = None
     state: CallState = CallState.RINGING
