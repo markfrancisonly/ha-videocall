@@ -33,6 +33,7 @@
           "answer_dashboard": "Dashboard path for mobile Answer deep link"
         },
         "data_description": {
+          "turn_credential": "Leave blank to keep the saved credential.",
           "turn_stun": "Adds stun: entries for your TURN host(s) so you don't need the Advanced ICE JSON. coturn and most self-hosted TURN servers answer STUN on the same port."
         }
       },

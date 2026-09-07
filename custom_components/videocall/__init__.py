@@ -415,7 +415,11 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
     # (ice_servers/TURN, ring_timeout, …) via a roster push. Broadcast one now,
     # otherwise the change doesn't reach open dashboards until they happen to
     # get an unrelated roster event or the page is reloaded/re-registered.
-    _LOGGER.debug("videocall options updated: %s", entry.options)
+    # never log the TURN secret — users paste debug logs into issues
+    _LOGGER.debug(
+        "videocall options updated: %s",
+        {k: "***" if k == OPT_TURN_CREDENTIAL else v for k, v in entry.options.items()},
+    )
     if DOMAIN in hass.data:
         ws_api.async_push_roster(hass)
 

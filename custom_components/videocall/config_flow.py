@@ -8,6 +8,11 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.core import callback
+from homeassistant.helpers.selector import (
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
 
 from .const import (
     OPT_TURN_CREDENTIAL,
@@ -77,6 +82,9 @@ class VideocallOptionsFlow(config_entries.OptionsFlow):
 
     async def async_step_settings(self, user_input=None):
         if user_input is not None:
+            # the credential is never pre-filled, so blank = keep the stored one
+            if not user_input.get(OPT_TURN_CREDENTIAL):
+                user_input.pop(OPT_TURN_CREDENTIAL, None)
             return self._save(user_input)
 
         opts = self.config_entry.options
@@ -87,7 +95,10 @@ class VideocallOptionsFlow(config_entries.OptionsFlow):
                 # (emptying turn_host disables TURN; default= would re-save it).
                 _prefill(OPT_TURN_HOST, opts): str,
                 _prefill(OPT_TURN_USERNAME, opts): str,
-                _prefill(OPT_TURN_CREDENTIAL, opts): str,
+                # secret: masked input, not echoed back into the form
+                vol.Optional(OPT_TURN_CREDENTIAL): TextSelector(
+                    TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                ),
                 _prefill(OPT_TURN_LAN_HOST, opts): str,
                 # coturn (and most self-hosted TURN) answers STUN on the same
                 # port — one checkbox instead of hand-writing stun: JSON.
