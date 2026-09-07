@@ -96,6 +96,7 @@ STUN alone. Configure it in *Video Call → Configure → Settings*:
 | TURN server | `turn.example.com` or `203.0.113.5:3478` |
 | TURN username / credential | from your TURN server |
 | TURN LAN address (optional) | `192.168.1.50` — on-network clients skip NAT hairpin |
+| TURN over TLS | tick when the server is behind a TLS terminator (e.g. `turn.example.com:443`); uses `turns:` on TCP, default port 5349 |
 
 A ready-to-run [coturn](https://github.com/coturn/coturn) example is in
 [`examples/coturn/`](examples/coturn/) — one container plus two router

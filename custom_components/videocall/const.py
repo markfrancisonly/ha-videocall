@@ -13,6 +13,7 @@ OPT_TURN_USERNAME = "turn_username"
 OPT_TURN_CREDENTIAL = "turn_credential"
 OPT_TURN_LAN_HOST = "turn_lan_host"      # optional LAN address for on-network clients
 OPT_TURN_STUN = "turn_stun"              # also derive stun: entries from the TURN host(s)
+OPT_TURN_TLS = "turn_tls"                # turns: (TLS over TCP) instead of plain turn: udp+tcp
 # Advanced: raw RTCIceServer[] JSON (merged with the TURN fields above).
 OPT_ICE_SERVERS = "ice_servers"          # JSON string, RTCIceServer[]
 OPT_RING_TIMEOUT = "ring_timeout"        # seconds
@@ -24,6 +25,7 @@ OPT_PERSON_NOTIFY_MAP = "person_notify_map"  # JSON: {"person.x": ["notify.mobil
 
 DEFAULT_ICE_SERVERS = '[{"urls":"stun:stun.l.google.com:19302"}]'
 DEFAULT_TURN_STUN = False
+DEFAULT_TURN_TLS = False
 DEFAULT_RING_TIMEOUT = 30
 DEFAULT_ALLOW_DROP_IN = True
 DEFAULT_ANSWER_DASHBOARD = "/lovelace"

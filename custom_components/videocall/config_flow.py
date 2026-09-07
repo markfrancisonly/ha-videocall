@@ -19,11 +19,13 @@ from .const import (
     OPT_TURN_HOST,
     OPT_TURN_LAN_HOST,
     OPT_TURN_STUN,
+    OPT_TURN_TLS,
     OPT_TURN_USERNAME,
     DEFAULT_ALLOW_DROP_IN,
     DEFAULT_ANSWER_DASHBOARD,
     DEFAULT_RING_TIMEOUT,
     DEFAULT_TURN_STUN,
+    DEFAULT_TURN_TLS,
     DOMAIN,
     OPT_ALLOW_DROP_IN,
     OPT_ANSWER_DASHBOARD,
@@ -100,6 +102,10 @@ class VideocallOptionsFlow(config_entries.OptionsFlow):
                     TextSelectorConfig(type=TextSelectorType.PASSWORD)
                 ),
                 _prefill(OPT_TURN_LAN_HOST, opts): str,
+                vol.Optional(
+                    OPT_TURN_TLS,
+                    default=opts.get(OPT_TURN_TLS, DEFAULT_TURN_TLS),
+                ): bool,
                 # coturn (and most self-hosted TURN) answers STUN on the same
                 # port — one checkbox instead of hand-writing stun: JSON.
                 vol.Optional(

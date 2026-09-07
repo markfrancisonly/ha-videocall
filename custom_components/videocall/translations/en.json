@@ -27,6 +27,7 @@
           "turn_username": "TURN username",
           "turn_credential": "TURN credential",
           "turn_lan_host": "TURN LAN address (optional — lets on-network clients skip NAT hairpin)",
+          "turn_tls": "TURN over TLS (turns:)",
           "turn_stun": "Use my TURN server for STUN too",
           "ring_timeout": "Ring timeout (seconds)",
           "allow_drop_in": "Allow drop-in by default (per-device consent is set on each device's card)",
@@ -34,7 +35,8 @@
         },
         "data_description": {
           "turn_credential": "Leave blank to keep the saved credential.",
-          "turn_stun": "Adds stun: entries for your TURN host(s) so you don't need the Advanced ICE JSON. coturn and most self-hosted TURN servers answer STUN on the same port."
+          "turn_stun": "Adds stun: entries for your TURN host(s) so you don't need the Advanced ICE JSON. coturn and most self-hosted TURN servers answer STUN on the same port.",
+          "turn_tls": "Connect with turns: on TCP (port defaults to 5349) instead of plain turn: on UDP+TCP. Use this when your TURN server sits behind a TLS terminator, e.g. on port 443. The LAN address stays plain turn:."
         }
       },
       "advanced": {

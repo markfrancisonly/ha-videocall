@@ -22,6 +22,7 @@ from .const import (
     DEFAULT_ICE_SERVERS,
     DEFAULT_RING_TIMEOUT,
     DEFAULT_TURN_STUN,
+    DEFAULT_TURN_TLS,
     DOMAIN,
     ENDED_CALL_LOG_SIZE,
     OPT_ALLOW_DROP_IN,
@@ -32,6 +33,7 @@ from .const import (
     OPT_TURN_HOST,
     OPT_TURN_LAN_HOST,
     OPT_TURN_STUN,
+    OPT_TURN_TLS,
     OPT_TURN_USERNAME,
 )
 from .frontend import async_register_frontend
@@ -69,9 +71,10 @@ class VideocallData:
         opts = self.entry.options
         host = (opts.get(OPT_TURN_HOST) or "").strip()
         lan = (opts.get(OPT_TURN_LAN_HOST) or "").strip()
+        tls = bool(opts.get(OPT_TURN_TLS, DEFAULT_TURN_TLS))
 
-        def _hostport(h: str) -> str:
-            return h if ":" in h else f"{h}:3478"
+        def _hostport(h: str, default: int = 3478) -> str:
+            return h if ":" in h else f"{h}:{default}"
 
         # Base STUN list, by precedence:
         #   1) "Use my TURN server for STUN" checkbox (+ a TURN host) → your own
@@ -80,10 +83,12 @@ class VideocallData:
         #      [] / null → NO default servers; a valid RTCIceServer[] → used as-is.
         #   3) the public default STUN.
         # Malformed advanced JSON falls back to the default (with a warning).
-        if opts.get(OPT_TURN_STUN, DEFAULT_TURN_STUN) and host:
-            stun = [f"stun:{_hostport(host)}"]
-            if lan:
-                stun.append(f"stun:{_hostport(lan)}")
+        # (a TLS-only public port can't answer STUN — browsers have no stuns: —
+        # so with TLS on only the LAN host qualifies)
+        stun = [f"stun:{_hostport(host)}"] if host and not tls else []
+        if host and lan:
+            stun.append(f"stun:{_hostport(lan)}")
+        if opts.get(OPT_TURN_STUN, DEFAULT_TURN_STUN) and stun:
             servers: list = [{"urls": stun}]
         else:
             raw = opts.get(OPT_ICE_SERVERS, "")
@@ -100,13 +105,16 @@ class VideocallData:
 
         # Compose the TURN entry from the simple fields (preferred config path)
         # so users never hand-write RTCIceServer JSON. host is "host" or
-        # "host:port" (defaults to 3478); the optional LAN address lets
-        # on-network clients relay without NAT hairpinning.
+        # "host:port" (defaults to 3478, or 5349 for TLS); the optional LAN
+        # address lets on-network clients relay without NAT hairpinning.
         if host:
-            urls = [
-                f"turn:{_hostport(host)}?transport=udp",
-                f"turn:{_hostport(host)}?transport=tcp",
-            ]
+            if tls:  # TLS is TCP-only
+                urls = [f"turns:{_hostport(host, 5349)}?transport=tcp"]
+            else:
+                urls = [
+                    f"turn:{_hostport(host)}?transport=udp",
+                    f"turn:{_hostport(host)}?transport=tcp",
+                ]
             if lan:
                 urls.append(f"turn:{_hostport(lan)}?transport=udp")
             turn: dict = {"urls": urls}
