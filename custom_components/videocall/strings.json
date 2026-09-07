@@ -44,12 +44,13 @@
           "person_notify_map": "Manual person → notify services map (JSON)"
         },
         "data_description": {
-          "ice_servers": "Override the ICE server list. Blank = default STUN (or your \"Use my TURN server for STUN\" setting) plus your TURN. Enter [] for no default ICE servers. Always merged with your TURN settings."
+          "ice_servers": "Override the ICE server list. Blank = default STUN (or your \"Use my TURN server for STUN\" setting) plus your TURN. Enter [] for no default ICE servers. Always merged with your TURN settings. Credentials are not allowed here; use the TURN credential field in Settings."
         }
       }
     },
     "error": {
-      "invalid_json": "Not valid JSON"
+      "invalid_json": "Not valid JSON",
+      "credential_in_json": "Don't put a TURN credential in the JSON; use the TURN credential field in Settings."
     },
     "abort": {
       "pruned": "Removed {count} offline endpoint(s). Online devices were not touched."

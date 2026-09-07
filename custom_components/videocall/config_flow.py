@@ -138,18 +138,25 @@ class VideocallOptionsFlow(config_entries.OptionsFlow):
                 else:
                     if not isinstance(parsed, expected):
                         errors[key] = "invalid_json"
+                    # secrets live only in the masked Settings field — this box
+                    # is echoed back in plain text every time it's opened.
+                    elif expected is list and any(
+                        isinstance(s, dict) and "credential" in s for s in parsed
+                    ):
+                        errors[key] = "credential_in_json"
             if not errors:
                 return self._save(user_input)
 
         # on an error re-render, keep the just-typed (invalid) values so the typo
         # is fixable in place; on first render pre-fill from saved options.
         src = user_input if user_input is not None else self.config_entry.options
+        multiline = TextSelector(TextSelectorConfig(multiline=True))
         schema = vol.Schema(
             {
                 # raw RTCIceServer[] override. Blank → default STUN (or the
                 # "Use TURN for STUN" checkbox) + your TURN; [] → no defaults.
-                _prefill(OPT_ICE_SERVERS, src): str,
-                _prefill(OPT_PERSON_NOTIFY_MAP, src, "{}"): str,
+                _prefill(OPT_ICE_SERVERS, src): multiline,
+                _prefill(OPT_PERSON_NOTIFY_MAP, src, "{}"): multiline,
             }
         )
         return self.async_show_form(

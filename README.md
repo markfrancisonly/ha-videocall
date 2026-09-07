@@ -100,7 +100,8 @@ STUN alone. Configure it in *Video Call → Configure → Settings*:
 A ready-to-run [coturn](https://github.com/coturn/coturn) example is in
 [`examples/coturn/`](examples/coturn/) — one container plus two router
 port-forwards. Advanced users can add raw `RTCIceServer` JSON as well; the
-simple fields and the JSON are merged.
+simple fields and the JSON are merged. Credentials are not accepted in the
+JSON — the TURN credential field is the only place a secret is stored.
 
 ## Mobile companion notes
 
