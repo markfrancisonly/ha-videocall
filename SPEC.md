@@ -514,6 +514,13 @@ other ending just clears the ring.
     - `in_call`: it is the caller or the answering callee of an answered call
       (`connecting`/`active`);
     - `idle`: none of the above.
+- `videocall_ended` bus event: besides `reason` and the call-log fields it
+  says who `missed` the call (still ringing when it ended unanswered:
+  `timeout` or `caller_cancel`) and who `declined` it, named the way
+  `videocall_incoming` names `ringing` (endpoint client ids) and
+  `mobile_notified` (phone notify services): `missed`, `missed_phones`,
+  `declined`, `declined_phones`. E.g.
+  `{{ 'mobile_app_x' in trigger.event.data.missed_phones }}`.
 - `sensor.videocall_last_call`: state = last call result
   (`answered|missed|declined|cancelled|error`), attributes = last-50 call log.
 - Services: `videocall.hangup` (optional `call_id`), `videocall.prune_endpoints`

@@ -290,7 +290,17 @@ def async_end_call(hass: HomeAssistant, call: Call, reason: EndReason) -> None:
 
     hass.bus.async_fire(
         BUS_EVT_ENDED,
-        {"call_id": call.call_id, "reason": reason.value, **call.log_entry()},
+        {
+            "call_id": call.call_id,
+            "reason": reason.value,
+            **call.log_entry(),
+            # who missed or declined it, named like videocall_incoming's
+            # ringing / mobile_notified (SPEC §8)
+            "missed": sorted(call.ringing) if unanswered else [],
+            "missed_phones": still if unanswered else [],
+            "declined": sorted(call.declined),
+            "declined_phones": sorted(call.declined_phones),
+        },
     )
     async_dispatcher_send(hass, SIGNAL_CALL_LOG, call.log_entry())
     async_push_roster(hass)

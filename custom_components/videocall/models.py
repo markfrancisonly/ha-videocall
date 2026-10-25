@@ -210,6 +210,7 @@ class Call:
     # ringing: neither declined nor answered elsewhere (SPEC §7)
     phones: dict[str, Phone] = field(default_factory=dict)
     ringing_phones: set[str] = field(default_factory=set)
+    declined_phones: set[str] = field(default_factory=set)
 
     callee_id: str | None = None            # set on accept
     created_at: float = field(default_factory=time.time)
@@ -329,6 +330,7 @@ class CallRegistry:
         if call.state is not CallState.RINGING or service not in call.ringing_phones:
             return None
         call.ringing_phones.discard(service)
+        call.declined_phones.add(service)
         device_id = call.phones[service].device_id
         apps = [
             e for e in endpoints
