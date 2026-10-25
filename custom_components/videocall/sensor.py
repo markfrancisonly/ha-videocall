@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
@@ -43,14 +43,15 @@ async def async_setup_entry(
 
 
 class EndpointCallStateSensor(SensorEntity):
-    """idle | ringing | in_call (SPEC §8). A phone's app also shows ringing
-    while a call's push to that phone is unanswered, app closed or not."""
+    """idle | calling | ringing | in_call (SPEC §8). A phone's app also shows
+    ringing while a call's push to that phone is unanswered, app closed or not."""
 
     _attr_should_poll = False
     _attr_has_entity_name = True
     _attr_name = "Call state"
-    _attr_options = ["idle", "ringing", "in_call"]
-    _attr_device_class = "enum"
+    _attr_translation_key = "call_state"
+    _attr_options = ["idle", "calling", "ringing", "in_call"]
+    _attr_device_class = SensorDeviceClass.ENUM
 
     def __init__(self, hass: HomeAssistant, endpoint: Endpoint) -> None:
         self.hass = hass

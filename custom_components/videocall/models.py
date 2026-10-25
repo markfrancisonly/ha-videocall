@@ -339,12 +339,12 @@ class CallRegistry:
         return apps
 
     def endpoint_state(self, ep: Endpoint) -> str:
-        """Call state of one endpoint (SPEC §8): idle | ringing | in_call."""
+        """Call state of one endpoint (SPEC §8): idle | calling | ringing | in_call."""
         call = self._calls.get(ep.call_id) if ep.call_id else None
         if call is not None:
             if call.state is not CallState.RINGING:
                 return "in_call"
-            return "ringing"
+            return "calling" if ep.client_id == call.caller_id else "ringing"
         if any(c.phone_of(ep) for c in self._calls.values()):
             return "ringing"
         return "idle"

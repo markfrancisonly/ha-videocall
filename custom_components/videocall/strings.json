@@ -57,5 +57,18 @@
     "abort": {
       "pruned": "Removed {count} offline endpoint(s). Online devices were not touched."
     }
+  },
+  "entity": {
+    "sensor": {
+      "call_state": {
+        "name": "Call state",
+        "state": {
+          "idle": "Idle",
+          "calling": "Calling",
+          "ringing": "Ringing",
+          "in_call": "In call"
+        }
+      }
+    }
   }
 }

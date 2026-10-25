@@ -351,7 +351,7 @@ config_flow.py     user step = instant create (no fields); options flow is a
                    answer_dashboard(str, default /lovelace). Advanced (raw JSON):
                    ice_servers, person_notify_map. Each step MERGEs into options.
 binary_sensor.py   per-endpoint connectivity entity (online)
-sensor.py          per-endpoint state (idle|ringing|in_call) +
+sensor.py          per-endpoint state (idle|calling|ringing|in_call) +
                    one global sensor.videocall_last_call
 services.yaml      videocall.hangup {call_id?} (blank = hang up all),
                    videocall.prune_endpoints (drop devices offline > N days)
@@ -484,9 +484,9 @@ so the push always goes out.
     diagnostic): on while the endpoint's registration is alive; off otherwise,
     including after a restart until it registers again.
   - `sensor.<name>_call_state` (enum):
-    - `ringing`: a call rings it and it hasn't answered or declined, or it
-      placed a call nobody has answered yet. For a phone's app this includes
-      a push to that phone, app open or closed;
+    - `calling`: it placed a call nobody has answered yet;
+    - `ringing`: a call rings it and it hasn't answered or declined. For a
+      phone's app this includes a push to that phone, app open or closed;
     - `in_call`: it is the caller or the answering callee of an answered call
       (`connecting`/`active`);
     - `idle`: none of the above.
