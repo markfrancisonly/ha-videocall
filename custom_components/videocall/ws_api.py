@@ -266,6 +266,9 @@ def async_fail_endpoint_calls(hass: HomeAssistant, client_id: str, reason: EndRe
             async_end_call(hass, call, reason)
         elif client_id in call.ringing:
             call.ringing.discard(client_id)
+            ep = data.endpoints.get(client_id)
+            if ep and ep.call_id == call.call_id:
+                ep.call_id = None
             if call.all_declined():
                 async_end_call(hass, call, EndReason.DECLINED)
 
