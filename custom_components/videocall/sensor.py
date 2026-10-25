@@ -16,7 +16,7 @@ from .const import (
     SIGNAL_ENDPOINT_UPDATE,
     SIGNAL_NEW_ENDPOINT,
 )
-from .models import CallState, Endpoint
+from .models import Endpoint
 
 
 async def async_setup_entry(
@@ -43,6 +43,9 @@ async def async_setup_entry(
 
 
 class EndpointCallStateSensor(SensorEntity):
+    """idle | ringing | in_call (SPEC §8). A phone's app also shows ringing
+    while a call's push to that phone is unanswered, app closed or not."""
+
     _attr_should_poll = False
     _attr_has_entity_name = True
     _attr_name = "Call state"
@@ -69,12 +72,7 @@ class EndpointCallStateSensor(SensorEntity):
     def native_value(self) -> str:
         data = self.hass.data[DOMAIN]
         ep = data.endpoints.get(self._client_id)
-        if not ep or not ep.call_id:
-            return "idle"
-        call = data.calls.get(ep.call_id)
-        if call and call.state is CallState.RINGING:
-            return "ringing"
-        return "in_call"
+        return data.calls.endpoint_state(ep) if ep else "idle"
 
 
 class LastCallSensor(SensorEntity):

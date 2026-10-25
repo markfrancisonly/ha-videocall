@@ -59,7 +59,7 @@ class VideocallData:
         self.calls = CallRegistry(log_size=ENDED_CALL_LOG_SIZE)
         self.ring_timeouts: dict[str, callable] = {}
         self.roster_unsub = None
-        self.mobile = MobileRinger(hass, self._options, self._mobile_decline)
+        self.mobile = MobileRinger(hass, self._options, self._phone_declined)
 
     # --- live options (no reload needed for value reads) --------------------
 
@@ -175,15 +175,17 @@ class VideocallData:
 
         # 1) companion app → unify with its mobile_app device (SPEC §4.4):
         #    the phone HA already knows ("Mark's iPhone …") IS this endpoint.
-        endpoint.notify_service = None
+        #    The link is also kept as our device's via device.
+        match = None
         if endpoint.ua_kind.startswith("companion") and endpoint.user_id:
             match = self.mobile.find_companion_match(
-                endpoint.user_id, endpoint.ua_kind, endpoint.ua_hint
+                endpoint.user_id, endpoint.ua_kind, endpoint.ua_hint,
+                linked=endpoint.phone_device_id,
             )
-            if match:
-                endpoint.notify_service = match["notify_service"]
-                adopted_name = match["name"]
-                suggested_area = match["area_id"]
+        endpoint.phone_device_id = match["device_id"] if match else None
+        if match:
+            adopted_name = match["name"]
+            suggested_area = match["area_id"]
 
         # 2) browser_mod adoption — but IGNORE its auto-generated junk names
         #    (browser_mod_<hex>_<hex>); those are ids, not names.
@@ -249,6 +251,9 @@ class VideocallData:
         if suggested_area and device.area_id is None:
             dev_reg.async_update_device(device.id, area_id=suggested_area)
             device = dev_reg.async_get(device.id)
+        if device.via_device_id != endpoint.phone_device_id:
+            dev_reg.async_update_device(device.id, via_device_id=endpoint.phone_device_id)
+            device = dev_reg.async_get(device.id)
 
         endpoint.device_id = device.id
         endpoint.name = device.name_by_user or device.name or name
@@ -264,12 +269,10 @@ class VideocallData:
     # --- mobile decline hook --------------------------------------------------
 
     @callback
-    def _mobile_decline(self, call_id: str) -> None:
+    def _phone_declined(self, call_id: str, service: str) -> None:
         call = self.calls.get(call_id)
-        if call is None:
-            return
-        if self.calls.decline(call, None):  # None = one mobile slot (SPEC §7.3)
-            ws_api.async_end_call(self.hass, call, EndReason.DECLINED)
+        if call is not None:
+            ws_api.async_decline_phone(self.hass, call, service)
 
 
 async def async_setup(hass: HomeAssistant, config) -> bool:

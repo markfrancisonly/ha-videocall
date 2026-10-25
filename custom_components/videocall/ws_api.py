@@ -49,7 +49,7 @@ from .const import (
     WS_REGISTER,
     WS_ROSTER,
 )
-from .models import Call, CallState, EndReason, Endpoint, InvalidTransition
+from .models import Call, CallState, EndReason, Endpoint, InvalidTransition, Phone
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -92,20 +92,25 @@ def _push(endpoint: Endpoint, event_type: str, payload: dict) -> None:
 def _roster_payload(hass: HomeAssistant) -> dict[str, Any]:
     """Shared by videocall/roster result and pushed roster events (SPEC §5.1)."""
     data = _data(hass)
-    endpoints = [e.info() for e in data.endpoints.all()]
     mobiles = data.mobile.list_mobile_devices()  # push-reachable even when app closed
 
     # UNIFY (SPEC §4.4): one roster row per phone. A mobile whose companion
-    # app is online carries that endpoint's id (in-app ring, online dot);
-    # the raw companion endpoint is then hidden by the card.
-    svc_online = {
-        e.notify_service: e.client_id
-        for e in data.endpoints.online()
-        if e.notify_service
-    }
+    # app is online carries that endpoint's id (in-app ring, online dot); an
+    # app endpoint whose phone is listed carries the phone's notify service,
+    # and the card hides it behind the phone row.
+    by_device = {m["device_id"]: m for m in mobiles if m["device_id"]}
     for m in mobiles:
-        m["online"] = m["notify_service"] in svc_online
-        m["endpoint_id"] = svc_online.get(m["notify_service"])
+        m["online"] = False
+        m["endpoint_id"] = None
+    endpoints = []
+    for e in data.endpoints.all():
+        info = e.info()
+        phone = by_device.get(e.phone_device_id) if e.phone_device_id else None
+        info["notify_service"] = phone["notify_service"] if phone else None
+        if phone and e.online:
+            phone["online"] = True
+            phone["endpoint_id"] = e.client_id
+        endpoints.append(info)
 
     areas: dict[str, dict] = {}
     area_reg = ar.async_get(hass)
@@ -179,38 +184,64 @@ def _person_user_id(hass: HomeAssistant, person_entity_id: str) -> str | None:
 
 
 def _resolve_ring(
-    hass: HomeAssistant, target_type: str, target_id: str | None, exclude: str = "",
+    hass: HomeAssistant, target_type: str, target_id: str | None,
+    caller: Endpoint | None = None,
 ):
-    """Resolve a target to (online endpoints, phone notify services, pushed
-    user_ids, person_user_id). Shared by the browser invite (§5.1) and the
-    doorbell ring (§14) so both fan out identically."""
+    """Resolve a target to (online endpoints, phones to push, person_user_id).
+    Shared by the browser invite (§5.1) and the doorbell ring (§14) so both
+    fan out identically."""
     data = _data(hass)
+    mobiles = {m["notify_service"]: m for m in data.mobile.list_mobile_devices()}
+
+    # mobile push per target type (SPEC §7.1) — reachable with the app CLOSED.
+    services: list[str] = []
+    if target_type == "person" and target_id:
+        services = data.mobile.resolve_notify_services(target_id)
+    elif target_type == "mobile" and target_id:
+        services = data.mobile.validate_services([target_id])
+    elif target_type == "area" and target_id:
+        services = data.mobile.services_for_area(target_id)
+    elif target_type == "all":
+        services = list(mobiles)
+    phones = [
+        Phone(s, mobiles[s]["device_id"], mobiles[s]["user_id"])
+        if s in mobiles else Phone(s)  # a person_notify_map service that isn't a phone
+        for s in dict.fromkeys(services)
+    ]
+
     person_user_id = None
     if target_type == "person":
         person_user_id = _person_user_id(hass, target_id or "")
-
+    phone_device_id = None
+    if target_type == "mobile" and services and services[0] in mobiles:
+        phone_device_id = mobiles[services[0]]["device_id"]
     targets = data.endpoints.resolve_targets(
-        target_type, target_id, exclude=exclude, person_user_id=person_user_id,
+        target_type, target_id, exclude=caller.client_id if caller else "",
+        person_user_id=person_user_id, phone_device_id=phone_device_id,
     )
+    return targets, phones, person_user_id
 
-    # mobile push per target type (SPEC §7.1) — reachable with the app CLOSED.
-    notify_services: list[str] = []
-    if target_type == "person" and target_id:
-        notify_services = data.mobile.resolve_notify_services(target_id)
-    elif target_type == "mobile" and target_id:
-        notify_services = data.mobile.validate_services([target_id])
-    elif target_type == "area" and target_id:
-        notify_services = data.mobile.services_for_area(target_id)
-    elif target_type == "all":
-        notify_services = [m["notify_service"] for m in data.mobile.list_mobile_devices()]
 
-    mobile_user_ids: set[str] = set()
-    if notify_services:
-        svc_user = {
-            m["notify_service"]: m["user_id"] for m in data.mobile.list_mobile_devices()
-        }
-        mobile_user_ids = {svc_user[s] for s in notify_services if svc_user.get(s)}
-    return targets, notify_services, mobile_user_ids, person_user_id
+async def _async_push_ring(hass: HomeAssistant, call: Call, caller_info: dict) -> None:
+    """Push the ring to the call's phones. A phone the push couldn't reach
+    isn't ringing; a call answered or ended meanwhile is cleared again."""
+    data = _data(hass)
+    failed = await data.mobile.async_send_ring(call, caller_info, list(call.phones))
+    call.ringing_phones -= failed
+    if call.state is not CallState.RINGING:
+        hass.async_create_task(data.mobile.async_clear_ring(call.call_id, list(call.phones)))
+
+
+@callback
+def _async_refresh(hass: HomeAssistant, call: Call) -> None:
+    """Re-evaluate the entities of every endpoint this call touches: its
+    parties, rung or declined endpoints, and the apps of its phones."""
+    data = _data(hass)
+    ids = {call.caller_id, call.callee_id, *call.ringing, *call.declined}
+    phones = {p.device_id for p in call.phones.values() if p.device_id}
+    for ep in data.endpoints.all():
+        if ep.client_id in ids or ep.phone_device_id in phones:
+            async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, ep.client_id)
 
 
 def async_end_call(hass: HomeAssistant, call: Call, reason: EndReason) -> None:
@@ -234,7 +265,6 @@ def async_end_call(hass: HomeAssistant, call: Call, reason: EndReason) -> None:
             if ep.call_id == call.call_id:
                 ep.call_id = None
             _push(ep, EVT_RING_CANCEL, {"call_id": call.call_id, "reason": reason.value})
-            async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, cid)
 
     for cid in (call.caller_id, call.callee_id):
         if not cid:
@@ -243,13 +273,12 @@ def async_end_call(hass: HomeAssistant, call: Call, reason: EndReason) -> None:
         if ep and ep.call_id == call.call_id:
             ep.call_id = None
             _push(ep, EVT_HANGUP, {"call_id": call.call_id, "reason": reason.value})
-        if ep:
-            async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, cid)
 
-    if call.mobile_notify_services and (was_ringing or reason is EndReason.CALLER_CANCEL):
+    if call.phones and (was_ringing or reason is EndReason.CALLER_CANCEL):
         hass.async_create_task(
-            data.mobile.async_clear_ring(call.call_id, call.mobile_notify_services)
+            data.mobile.async_clear_ring(call.call_id, list(call.phones))
         )
+    _async_refresh(hass, call)
 
     hass.bus.async_fire(
         BUS_EVT_ENDED,
@@ -272,6 +301,26 @@ def async_fail_endpoint_calls(hass: HomeAssistant, client_id: str, reason: EndRe
                 ep.call_id = None
             if call.all_declined():
                 async_end_call(hass, call, EndReason.DECLINED)
+
+
+@callback
+def async_decline_phone(hass: HomeAssistant, call: Call, service: str) -> None:
+    """One phone declined, on its notification or in its app (SPEC §7.3). It
+    stops ringing everywhere, in-app included, and stays out of this call."""
+    data = _data(hass)
+    apps = data.calls.decline_phone(call, service, data.endpoints.all())
+    if apps is None:
+        return
+    for ep in apps:
+        if ep.call_id == call.call_id:
+            ep.call_id = None
+        _push(ep, EVT_RING_CANCEL, {"call_id": call.call_id, "reason": EndReason.DECLINED.value})
+    if call.all_declined():
+        async_end_call(hass, call, EndReason.DECLINED)
+        return
+    # the call rings on elsewhere; take it off this phone's screen
+    hass.async_create_task(data.mobile.async_clear_ring(call.call_id, [service]))
+    _async_refresh(hass, call)
 
 
 # --------------------------------------------------------------------------
@@ -307,10 +356,8 @@ async def async_ring_doorbell(
     data = _data(hass)
     target_type = target["type"]
     target_id = target.get("id")
-    targets, notify_services, mobile_user_ids, _ = _resolve_ring(
-        hass, target_type, target_id,
-    )
-    if not targets and not notify_services:
+    targets, phones, _ = _resolve_ring(hass, target_type, target_id)
+    if not targets and not phones:
         raise ValueError("no_targets")
 
     caller_info = _doorbell_caller_info(doorbell)
@@ -322,13 +369,13 @@ async def async_ring_doorbell(
             target_type=target_type,
             target_id=target_id,
             ringing={t.client_id for t in targets},
-            mobile_pending=len(notify_services),
-            mobile_notify_services=notify_services,
-            mobile_user_ids=mobile_user_ids,
+            phones={p.notify_service: p for p in phones},
+            ringing_phones={p.notify_service for p in phones},
             caller_info=caller_info,
             doorbell=doorbell,
         )
     )
+    notify_services = list(call.phones)
 
     for t in targets:
         t.call_id = call.call_id  # busy-guarded while ringing
@@ -340,10 +387,10 @@ async def async_ring_doorbell(
             "drop_in": False,
             "doorbell": doorbell,
         })
-        async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, t.client_id)
 
-    if notify_services:
-        await data.mobile.async_send_ring(call, caller_info, notify_services)
+    if call.phones:
+        await _async_push_ring(hass, call, caller_info)
+    _async_refresh(hass, call)
 
     _LOGGER.info(
         "doorbell ring %s (%s): %d in-app, %d phone(s)",
@@ -486,17 +533,15 @@ async def ws_register(hass: HomeAssistant, connection, msg: dict) -> None:
 
     # LATE RING DELIVERY (SPEC §7.2): a companion app cold-started from a ring
     # push was offline at invite time and never received the ring event. If
-    # this endpoint's user has a phone that was pushed for a still-ringing
-    # call, ring the new endpoint NOW — the in-app full-screen ring appears no
-    # matter how the app was opened, and the Answer tap supplies the user
-    # gesture iOS requires for getUserMedia.
-    if endpoint.user_id and not endpoint.in_call:
+    # the call still rings its phone, ring the new endpoint NOW — the in-app
+    # full-screen ring appears no matter how the app was opened, and the
+    # Answer tap supplies the user gesture iOS requires for getUserMedia. A
+    # phone that declined stays declined.
+    if not endpoint.in_call:
         for ringing_call in data.calls.active():
-            if ringing_call.state is not CallState.RINGING:
+            if not ringing_call.invites(endpoint):
                 continue
-            if endpoint.user_id not in ringing_call.mobile_user_ids:
-                continue
-            if endpoint.client_id == ringing_call.caller_id:
+            if endpoint.client_id in (ringing_call.caller_id, *ringing_call.declined):
                 continue
             ringing_call.ringing.add(endpoint.client_id)
             endpoint.call_id = ringing_call.call_id
@@ -559,11 +604,11 @@ async def ws_invite(hass: HomeAssistant, connection, msg: dict) -> None:
     target = msg["target"]
     target_type = target["type"]
     target_id = target.get("id")
-    targets, notify_services, mobile_user_ids, person_user_id = _resolve_ring(
-        hass, target_type, target_id, exclude=caller.client_id,
+    targets, phones, person_user_id = _resolve_ring(
+        hass, target_type, target_id, caller,
     )
 
-    if not targets and not notify_services:
+    if not targets and not phones:
         if target_type == "person":
             # Most common cause: the person entity is linked to a stale/deleted
             # user_id, so neither browser sessions nor mobile_app registrations
@@ -587,12 +632,12 @@ async def ws_invite(hass: HomeAssistant, connection, msg: dict) -> None:
             target_type=target_type,
             target_id=target_id,
             ringing={t.client_id for t in targets},
-            mobile_pending=len(notify_services),
-            mobile_notify_services=notify_services,
-            mobile_user_ids=mobile_user_ids,
+            phones={p.notify_service: p for p in phones},
+            ringing_phones={p.notify_service for p in phones},
         )
     )
     caller.call_id = call.call_id
+    notify_services = list(call.phones)
 
     for t in targets:
         t.call_id = call.call_id  # rung endpoints are busy-guarded while ringing
@@ -604,10 +649,10 @@ async def ws_invite(hass: HomeAssistant, connection, msg: dict) -> None:
             # per-endpoint consent: unlisted devices follow the global default
             "drop_in": drop_in and data.drop_in_allowed(t, caller),
         })
-        async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, t.client_id)
 
-    if notify_services:
-        await data.mobile.async_send_ring(call, caller.info(), notify_services)
+    if call.phones:
+        await _async_push_ring(hass, call, caller.info())
+    _async_refresh(hass, call)
 
     # observability: a successful invite/push logs nothing otherwise, which
     # made "closed iOS gets no ring" impossible to see from the logs.
@@ -644,7 +689,6 @@ async def ws_invite(hass: HomeAssistant, connection, msg: dict) -> None:
             "mobile_notified": notify_services,
         },
     )
-    async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, caller.client_id)
     connection.send_result(
         msg["id"], {"ringing": sorted(call.ringing), "mobile_notified": notify_services}
     )
@@ -706,14 +750,15 @@ def ws_accept(hass: HomeAssistant, connection, msg: dict) -> None:
     if callee.in_call and callee.call_id != call.call_id:
         connection.send_error(msg["id"], "busy", "Endpoint busy in another call")
         return
-    # a late joiner (cold-started from the push) must belong to a pushed phone's user
-    if callee.client_id not in call.ringing and callee.user_id not in call.mobile_user_ids:
-        connection.send_error(msg["id"], "not_invited", "Not a recipient of this call")
-        return
     try:
-        others = data.calls.accept(call, callee.client_id)
+        others = data.calls.accept(call, callee)
     except InvalidTransition as err:
-        connection.send_error(msg["id"], str(err), "Call already answered or ended")
+        code = str(err)
+        connection.send_error(
+            msg["id"], code,
+            "Not a recipient of this call" if code == "not_invited"
+            else "Call already answered or ended",
+        )
         return
 
     callee.call_id = call.call_id
@@ -739,17 +784,15 @@ def ws_accept(hass: HomeAssistant, connection, msg: dict) -> None:
                   {"call_id": call.call_id, "reason": "answered_elsewhere"})
             async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, cid)
 
-    if call.mobile_notify_services:
+    if call.phones:
         hass.async_create_task(
-            data.mobile.async_clear_ring(call.call_id, call.mobile_notify_services)
+            data.mobile.async_clear_ring(call.call_id, list(call.phones))
         )
 
     caller = data.endpoints.get(call.caller_id)
     if caller:
         _push(caller, EVT_ACCEPTED, {"call_id": call.call_id, "peer": callee.info()})
-        async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, caller.client_id)
-
-    async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, callee.client_id)
+    _async_refresh(hass, call)
     # media/caller in the result let a late-joining endpoint (deep link, no
     # ring event ever received) build its session from the accept alone. For a
     # doorbell (SPEC §14) there is no caller endpoint — caller_info + doorbell
@@ -781,17 +824,16 @@ def ws_decline(hass: HomeAssistant, connection, msg: dict) -> None:
     if ep is None:
         connection.send_error(msg["id"], "not_registered", "Register first")
         return
-    if ep.call_id == call.call_id:
-        ep.call_id = None
-        async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, ep.client_id)
-    done = data.calls.decline(call, msg["client_id"])
-    # a phone's companion app declining in-app also declines that phone's push
-    if not done and ep.notify_service in call.mobile_notify_services:
-        done = data.calls.decline(call, None)
-        if not done:  # the call rings on elsewhere; clear this phone's notification
-            hass.async_create_task(data.mobile.async_clear_ring(call.call_id, [ep.notify_service]))
-    if done:
-        async_end_call(hass, call, EndReason.DECLINED)
+    # a phone's companion app declining in-app declines that phone's push too
+    if (service := call.phone_of(ep)) is not None:
+        async_decline_phone(hass, call, service)
+    else:
+        if ep.call_id == call.call_id:
+            ep.call_id = None
+        if data.calls.decline(call, ep.client_id):
+            async_end_call(hass, call, EndReason.DECLINED)
+        else:
+            _async_refresh(hass, call)
     connection.send_result(msg["id"])
 
 

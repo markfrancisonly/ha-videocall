@@ -143,16 +143,22 @@ and are individually callable via target type `mobile`.
 
 **Companion↔endpoint unification (one row per phone).** A registering
 companion endpoint is correlated to its `mobile_app` entry by `user_id` +
-platform (`os_name`) + UA hint (`iphone`/`ipad` vs the registration `model`);
-only a UNIQUE match links (`endpoint.notify_service` set). A same-platform tie
-the coarse hint can't split (e.g. two iPads on one user) is broken toward the
-device that's currently alive (its entities aren't `unavailable`); otherwise it
-falls back to an unlinked endpoint, never a guess. A linked endpoint adopts the
+platform (`os_name`) + UA hint (`iphone`/`ipad` vs the registration `model`).
+The link is stored as the videocall device's **via device** (the HA UI shows
+"Connected via Mark's iPhone"); HA drops it when the phone's device is
+removed. Precedence at registration: the phone the
+endpoint is already linked to, while it still matches (same user, platform
+and hint); else a UNIQUE match; a same-platform tie the coarse hint can't
+split (e.g. two iPads on one user) is broken toward the device that's
+currently alive (its entities aren't `unavailable`); otherwise the endpoint
+is unlinked, never a guess. Candidates come from the `mobile_app` entries
+themselves, not from the notify services, so linking doesn't depend on when
+mobile_app's notify platform finishes loading. A linked endpoint adopts the
 mobile_app device's name and area, and the roster marks the mobile row
-`online` + `endpoint_id` while hiding the raw endpoint row: calling the phone
-rings in-app when the app is open (endpoint target) and pushes when closed
-(mobile target). The online indicator thus lands on "Mark's iPhone", not on
-an anonymous "Videocall browser".
+`online` + `endpoint_id` while the card hides the raw endpoint row: calling
+the phone pushes and also rings the app in-app when it is open. The online
+indicator thus lands on "Mark's iPhone", not on an anonymous "Videocall
+browser".
 
 **Device naming rules.** Opaque ids NEVER go in display names: `client_id`
 lives in the device's `serial_number` field, `ua_kind` in `model`.
@@ -193,11 +199,11 @@ caller-minted UUIDv4.
 | Command | Payload | Result / effect |
 |---|---|---|
 | `videocall/register` | `client_id`, `ua_kind`, `name?`, `browser_mod_id?` | Registers endpoint + **subscribes** it to events (the long-lived message id). Result: `{endpoint_id, name, area_id, area_name, ice_servers, ring_timeout, allow_drop_in}`. Re-register with same `client_id` on a new connection supersedes the old one, for the same HA user only: a different user gets `client_id_taken` and the card mints a new id. |
-| `videocall/roster` | — | Result: `{endpoints: [EndpointInfo], mobiles: [MobileInfo], areas: [{area_id, name, online_count, push_count}], persons: [{entity_id, name, user_id, online}], config: {ice_servers, ring_timeout, allow_drop_in}}`. `persons[].online` reflects browser presence only — persons and mobiles are ALWAYS callable via push (§4.4). `config` rides on every roster result AND push — it is how entry options (esp. a TURN server) reach clients, since the register result is consumed by the subscription helper. |
+| `videocall/roster` | — | Result: `{endpoints: [EndpointInfo + notify_service], mobiles: [MobileInfo + online, endpoint_id], areas: [{area_id, name, online_count, push_count}], persons: [{entity_id, name, user_id, online}], config: {ice_servers, ring_timeout, allow_drop_in}}`. An endpoint's `notify_service` is its linked phone's when that phone is in `mobiles` (the card then shows the phone row only), else `null`. `persons[].online` reflects browser presence only — persons and mobiles are ALWAYS callable via push (§4.4). `config` rides on every roster result AND push — it is how entry options (esp. a TURN server) reach clients, since the register result is consumed by the subscription helper. |
 | `videocall/invite` | `call_id`, `target: {type: endpoint\|area\|person\|mobile\|all, id?}`, `media: video\|audio`, `drop_in?: bool` | Creates call in state `ringing`; pushes `ring` to resolved endpoints; pushes mobile notifications (person → their phones; mobile → that phone, whose open companion app also rings in-app; area → phones in the area; all → every phone); arms ring timeout. `drop_in: true` → `ring` carries `drop_in` and receiving browser endpoints auto-accept (§5.5); rejected with `drop_in_disabled` if the option is off. Errors: `busy_here` (a target endpoint is in a call — still rings idle ones), `no_targets`, `caller_busy`. |
 | `videocall/cancel` | `call_id` | Caller aborts ringing → `ring_cancel` to all ringing endpoints + mobile clear. |
-| `videocall/accept` | `call_id`, `client_id` | First accept wins (`call.state=connecting`); others get `ring_cancel`; mobile notifications cleared; caller gets `accepted {peer: EndpointInfo}`. Result: `{caller: EndpointInfo, media}` — enough for a **late joiner** to build its session without ever having received `ring`. An endpoint NOT in the ring set may accept iff the call pushed to a phone of the endpoint's own user (cold-start deep-link join, §7.2); otherwise `not_invited`. Accept on an answered/ended call → `too_late`/`unknown_call`; endpoint busy in another call → `busy`. |
-| `videocall/decline` | `call_id`, `reason?` | Marks that endpoint declined. When **all** rung targets have declined and no mobile push is pending → call ends, caller gets `hangup {reason: declined}`. |
+| `videocall/accept` | `call_id`, `client_id` | First accept wins (`call.state=connecting`); others get `ring_cancel`; mobile notifications cleared; caller gets `accepted {peer: EndpointInfo}`. Result: `{caller: EndpointInfo, media}` — enough for a **late joiner** to build its session without ever having received `ring`. An endpoint NOT in the ring set may accept while the call still rings its phone: a linked app only through its own phone, an unlinked companion app through any still-ringing phone of its user (cold-start deep-link join, §7.2); otherwise `not_invited`. Accept on an answered/ended call → `too_late` (checked first)/`unknown_call`; endpoint busy in another call → `busy`. |
+| `videocall/decline` | `call_id`, `reason?` | Marks that endpoint declined; a phone's app declining while its phone rings declines the phone (§7.3). When no endpoint and no phone is left ringing → call ends, caller gets `hangup {reason: declined}`. |
 | `videocall/offer` | `call_id`, `sdp` | Caller→callee relay (only in `connecting`). |
 | `videocall/answer` | `call_id`, `sdp` | Callee→caller relay; server sets `call.state=active`, stamps `answered_at`, fires `videocall_answered` bus event. |
 | `videocall/candidate` | `call_id`, `candidate` (JSON of RTCIceCandidateInit, or `null` = end-of-candidates) | Relayed to the other party. Valid in `connecting`/`active`. |
@@ -208,7 +214,7 @@ caller-minted UUIDv4.
 `{event_type, ...}` where `event_type` ∈:
 
 - `ring {call_id, media, caller: EndpointInfo, target_type, drop_in}`
-- `ring_cancel {call_id, reason: answered_elsewhere|caller_cancel|timeout}`
+- `ring_cancel {call_id, reason: answered_elsewhere|caller_cancel|timeout|declined|superseded}` (`declined`: the phone this app runs on declined from its notification)
 - `accepted {call_id, peer: EndpointInfo}` (to caller — begin gUM + offer)
 - `offer {call_id, sdp}` / `answer {call_id, sdp}` / `candidate {call_id, candidate}`
 - `hangup {call_id, reason: hangup|declined|timeout|peer_disconnected|superseded|error}`
@@ -395,7 +401,7 @@ data:
       uri: "{answer_dashboard}?vcall_answer={call_id}"
       activationMode: foreground   # iOS: REQUIRED — default is background and
                                    # the app never opens (Android ignores it)
-    - action: "VCALL_DECLINE_{call_id}"
+    - action: "VCALL_DECLINE_{call_id}|{notify_service}"   # names the phone
       title: "Decline"
   # iOS specifics (harmless on Android):
   url: "{answer_dashboard}?vcall_answer={call_id}"
@@ -410,13 +416,15 @@ data:
 Clear (answered elsewhere / cancel / timeout): `message: clear_notification`,
 `data: {tag: "vcall-{call_id}"}` to the same services.
 
-**Open-app suppression:** if a user's companion app is OPEN — i.e. an online
-endpoint with `ua_kind: companion-*` and that `user_id` is in the invite's
-ring set — the push to that user's phones is skipped: the in-app ring (overlay
-+ ringtone) IS the notification. Push remains the closed-app path. Correlation
-is by user, not by physical phone (one-phone-per-user assumption; documented
-limitation for multi-phone users, whose other phones simply don't ring while
-one app is open).
+**Always push.** Resolved phones are pushed even when their app looks open: a
+backgrounded or force-quit iOS app keeps a zombie websocket for the whole
+heartbeat window, so "online" can't be trusted to deliver a ring. An open app
+rings in-app as well; the shared tag clears the notification when the call is
+answered, declined or ends.
+
+Each pushed phone is tracked in the call (`phones`, by notify service) and
+stays **ringing** until it declines, the call is answered, or the call ends.
+A push that can't be sent (no such notify service) doesn't count as ringing.
 
 ### 7.2 Answer path
 App opens `{answer_dashboard}?vcall_answer=<call_id>` in its webview → core
@@ -436,10 +444,11 @@ endpoint at invite time, so the `ring` event was never delivered to it. Two
 mechanisms cooperate, in order of authority:
 
 1. **Server-side late ring delivery** — the reliable path, independent of URL
-   handling. On `videocall/register`, if the endpoint's `user_id` is in a
-   still-ringing call's `mobile_user_ids` (i.e. that user's phone was pushed),
-   the server adds the endpoint to the ring set and pushes it a `ring` event
-   immediately. Opening the app ANY way — notification body, Answer action, or
+   handling. On `videocall/register`, if a still-ringing call still rings the
+   endpoint's phone (a linked app: its own phone; an unlinked companion app:
+   any phone of its user), the server adds the endpoint to the ring set and
+   pushes it a `ring` event immediately. A phone that declined stays declined:
+   its app is not rung again. Opening the app ANY way — notification body, Answer action, or
    plain launch — lands on the full-screen in-app ring with caller identity.
    On iOS this is also the gUM story: **WKWebView requires a user gesture for
    getUserMedia**, so auto-accept would fail — the Answer tap on the late ring
@@ -447,25 +456,38 @@ mechanisms cooperate, in order of authority:
 2. **Deep-link auto-accept** (`?vcall_answer` — Android companion only, where
    gestureless gUM works): accept the (late-)rung session directly; if no ring
    arrived within ~2.5 s (e.g. browsers-only ring set), build a callee session
-   from `videocall/accept` alone — the server permits the un-rung accept for
-   mobile-pushed calls and returns `{caller, media}`. A dead call comes back
+   from `videocall/accept` alone — the server permits the un-rung accept
+   under the same rule and returns `{caller, media}`. A dead call comes back
    `unknown_call`/`too_late` → quiet "call ended"/"answered elsewhere"
    teardown, not an error.
 
 ### 7.3 Decline path
-Companion fires HA event `mobile_app_notification_action` with
-`action == "VCALL_DECLINE_<call_id>"`; `mobile.py` listener maps it to a
-decline (counts toward the all-declined check with one virtual "mobile" slot
-per person). A companion app declining in-app also uses up its own phone's
-slot and clears that phone's notification, so a call to one phone ends when that phone declines. The card targets a
-phone as `mobile` even while its app looks open, so the push always goes out.
+A phone declines in one of two ways, with the same effect:
+- its notification: the companion fires HA event
+  `mobile_app_notification_action` with
+  `action == "VCALL_DECLINE_<call_id>|<notify_service>"` (split at the last
+  `|`; call ids are client-minted);
+- its app, in-app, while the call rings that phone.
+
+The phone stops ringing, its app's in-app ring (if any) is cancelled with
+`ring_cancel {reason: declined}`, and it stays out of the call: no late ring,
+and its app's accept gets `not_invited`. If no endpoint and no phone is left
+ringing the call ends as declined; otherwise only that phone's notification is
+cleared. The card targets a phone as `mobile` even while its app looks open,
+so the push always goes out.
 
 ## 8. Entities & services
 
-- Per endpoint device: `binary_sensor.<name>_online` (device_class
-  connectivity, entity_category diagnostic) and `sensor.<name>_call_state`
-  (`idle|ringing|in_call`). Dynamic add via `async_dispatcher_send` on first
-  registration; entities go unavailable when offline > 0 s (presence is live).
+- Per endpoint device, created on its first registration:
+  - `binary_sensor.<name>_online` (device_class connectivity, entity_category
+    diagnostic): on while the endpoint's registration is alive, off after.
+  - `sensor.<name>_call_state` (enum):
+    - `ringing`: a call rings it and it hasn't answered or declined, or it
+      placed a call nobody has answered yet. For a phone's app this includes
+      a push to that phone, app open or closed;
+    - `in_call`: it is the caller or the answering callee of an answered call
+      (`connecting`/`active`);
+    - `idle`: none of the above.
 - `sensor.videocall_last_call`: state = last call result
   (`answered|missed|declined|cancelled|error`), attributes = last-50 call log.
 - Services: `videocall.hangup` (optional `call_id`), `videocall.prune_endpoints`

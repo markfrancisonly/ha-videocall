@@ -49,9 +49,9 @@ class Endpoint:
     browser_hint: str | None = None        # "Chrome (Windows)" — plain-browser naming
     name: str = ""
     browser_mod_id: str | None = None
-    # set when this endpoint IS a companion app unified with a mobile_app
-    # device (SPEC §4.4) — links the roster's phone row to this endpoint
-    notify_service: str | None = None
+    # the mobile_app device this endpoint is the companion app of (SPEC §4.4);
+    # also kept as the videocall device's via device
+    phone_device_id: str | None = None
     # DEVICE-OWNED drop-in consent (SPEC §5.4a): None = follow the global
     # default; [] = nobody; [user_id/name, …] = exclusively those callers
     drop_in_allow: list | None = None
@@ -95,7 +95,6 @@ class Endpoint:
             "ua_kind": self.ua_kind,
             "user_id": self.user_id,
             "user_name": self.user_name,
-            "notify_service": self.notify_service,
             "online": self.online,
             "in_call": self.in_call,
         }
@@ -154,7 +153,7 @@ class EndpointRegistry:
 
     def resolve_targets(
         self, target_type: str, target_id: str | None, exclude: str,
-        person_user_id: str | None = None,
+        person_user_id: str | None = None, phone_device_id: str | None = None,
     ) -> list[Endpoint]:
         """Online, idle endpoints matching the target; caller excluded."""
         candidates = [
@@ -165,7 +164,10 @@ class EndpointRegistry:
             return [e for e in candidates if e.client_id == target_id]
         if target_type == "mobile":
             # the phone's open companion app rings in-app; the push goes out too
-            return [e for e in candidates if e.notify_service == target_id]
+            return [
+                e for e in candidates
+                if phone_device_id and e.phone_device_id == phone_device_id
+            ]
         if target_type == "area":
             return [e for e in candidates if e.area_id == target_id]
         if target_type == "person":
@@ -173,6 +175,15 @@ class EndpointRegistry:
         if target_type == "all":
             return candidates
         return []
+
+
+@dataclass(frozen=True)
+class Phone:
+    """A phone (mobile_app device) a call pushed its ring to (SPEC §7.1)."""
+
+    notify_service: str
+    device_id: str | None = None           # links the phone's companion endpoint
+    user_id: str | None = None
 
 
 @dataclass
@@ -195,9 +206,10 @@ class Call:
 
     ringing: set[str] = field(default_factory=set)   # client_ids currently rung
     declined: set[str] = field(default_factory=set)
-    mobile_pending: int = 0                 # virtual decline slots for pushed phones
-    mobile_notify_services: list[str] = field(default_factory=list)  # for clear
-    mobile_user_ids: set[str] = field(default_factory=set)  # late ring delivery
+    # every phone the ring was pushed to, by notify service, and those still
+    # ringing: neither declined nor answered elsewhere (SPEC §7)
+    phones: dict[str, Phone] = field(default_factory=dict)
+    ringing_phones: set[str] = field(default_factory=set)
 
     callee_id: str | None = None            # set on accept
     created_at: float = field(default_factory=time.time)
@@ -215,9 +227,30 @@ class Call:
             return None
         return _peer
 
+    def phone_of(self, ep: Endpoint) -> str | None:
+        """Notify service of the still-ringing phone whose app `ep` is."""
+        if self.state is CallState.RINGING and ep.phone_device_id:
+            for service in self.ringing_phones:
+                if self.phones[service].device_id == ep.phone_device_id:
+                    return service
+        return None
+
+    def invites(self, ep: Endpoint) -> bool:
+        """May `ep` join although it was not rung (SPEC §7.2)? A linked app
+        only while its own phone rings; an unlinked companion app while any
+        phone of its user rings."""
+        if ep.phone_device_id:
+            return self.phone_of(ep) is not None
+        return (
+            self.state is CallState.RINGING
+            and ep.ua_kind.startswith("companion")
+            and ep.user_id is not None
+            and any(self.phones[s].user_id == ep.user_id for s in self.ringing_phones)
+        )
+
     def all_declined(self) -> bool:
-        """Every rung endpoint declined and no mobile push can still answer."""
-        return not self.ringing and self.mobile_pending <= 0
+        """Nobody is left to answer: no endpoint and no phone still rings."""
+        return not self.ringing and not self.ringing_phones
 
     def log_entry(self) -> dict[str, Any]:
         return {
@@ -254,23 +287,23 @@ class CallRegistry:
 
     # --- transitions --------------------------------------------------------
 
-    def accept(self, call: Call, callee_id: str) -> set[str]:
+    def accept(self, call: Call, callee: Endpoint) -> set[str]:
         """First accept wins. Returns the OTHER ringing endpoints to cancel.
 
-        An endpoint NOT in the ring set may accept when the call pushed to
-        mobile: a cold-started companion app never received the ring event
-        (it wasn't online at invite time) and joins late via the notification
-        deep link (SPEC §7.2).
+        An endpoint NOT in the ring set may accept while the call invites it
+        through a pushed phone: a cold-started companion app never received
+        the ring event (it wasn't online at invite time) and joins late via
+        the notification deep link (SPEC §7.2).
         """
         if call.state is not CallState.RINGING:
             raise InvalidTransition("too_late")
-        if callee_id not in call.ringing and not call.mobile_notify_services:
-            raise InvalidTransition("too_late")
+        if callee.client_id not in call.ringing and not call.invites(callee):
+            raise InvalidTransition("not_invited")
         call.state = CallState.CONNECTING
-        call.callee_id = callee_id
-        others = set(call.ringing) - {callee_id}
+        call.callee_id = callee.client_id
+        others = set(call.ringing) - {callee.client_id}
         call.ringing.clear()
-        call.mobile_pending = 0
+        call.ringing_phones.clear()
         return others
 
     def mark_active(self, call: Call) -> None:
@@ -278,17 +311,43 @@ class CallRegistry:
             call.state = CallState.ACTIVE
             call.answered_at = time.time()
 
-    def decline(self, call: Call, client_id: str | None) -> bool:
-        """Register a decline (client_id None = one mobile slot). True if that
-        exhausted all possible answerers."""
+    def decline(self, call: Call, client_id: str) -> bool:
+        """Register an endpoint's decline. True if nobody is left to answer."""
         if call.state is not CallState.RINGING:
             return False
-        if client_id is None:
-            call.mobile_pending = max(0, call.mobile_pending - 1)
-        else:
-            call.ringing.discard(client_id)
-            call.declined.add(client_id)
+        call.ringing.discard(client_id)
+        call.declined.add(client_id)
         return call.all_declined()
+
+    def decline_phone(
+        self, call: Call, service: str, endpoints: Iterable[Endpoint]
+    ) -> list[Endpoint] | None:
+        """A phone declined, on its notification or in its app (SPEC §7.3):
+        the phone stops ringing and so does its app's in-app ring. Returns the
+        app endpoints taken out of the ring set; None if the phone wasn't
+        ringing."""
+        if call.state is not CallState.RINGING or service not in call.ringing_phones:
+            return None
+        call.ringing_phones.discard(service)
+        device_id = call.phones[service].device_id
+        apps = [
+            e for e in endpoints
+            if device_id and e.phone_device_id == device_id and e.client_id in call.ringing
+        ]
+        for e in apps:
+            self.decline(call, e.client_id)
+        return apps
+
+    def endpoint_state(self, ep: Endpoint) -> str:
+        """Call state of one endpoint (SPEC §8): idle | ringing | in_call."""
+        call = self._calls.get(ep.call_id) if ep.call_id else None
+        if call is not None:
+            if call.state is not CallState.RINGING:
+                return "in_call"
+            return "ringing"
+        if any(c.phone_of(ep) for c in self._calls.values()):
+            return "ringing"
+        return "idle"
 
     def end(self, call: Call, reason: EndReason) -> None:
         if call.state is CallState.ENDED:

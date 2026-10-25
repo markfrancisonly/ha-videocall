@@ -67,7 +67,7 @@ BUS_EVT_ENDED = "videocall_ended"
 
 # --- mobile push --------------------------------------------------------------
 NOTIF_TAG_PREFIX = "vcall-"                  # tag = vcall-<call_id>
-DECLINE_ACTION_PREFIX = "VCALL_DECLINE_"     # action = VCALL_DECLINE_<call_id>
+DECLINE_ACTION_PREFIX = "VCALL_DECLINE_"     # VCALL_DECLINE_<call_id>|<notify_service>
 NOTIF_CHANNEL = "Video Call"
 DEEP_LINK_PARAM = "vcall_answer"
 

@@ -2,7 +2,7 @@
 
 Phones are push-then-join: ring = actionable notification; Answer deep-links
 into a dashboard whose card resource joins the call; Decline comes back as a
-mobile_app_notification_action event.
+mobile_app_notification_action event naming the call and the phone.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from .const import (
     NOTIF_CHANNEL,
     NOTIF_TAG_PREFIX,
 )
-from .models import Call, EndReason
+from .models import Call
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,10 +35,10 @@ NOTIFICATION_ACTION_EVENT = "mobile_app_notification_action"
 class MobileRinger:
     """Resolves person → notify services and sends/clears ring notifications."""
 
-    def __init__(self, hass: HomeAssistant, get_options, end_call_cb) -> None:
+    def __init__(self, hass: HomeAssistant, get_options, decline_cb) -> None:
         self.hass = hass
         self._get_options = get_options       # () -> dict (live entry options)
-        self._end_call_cb = end_call_cb       # (call_id, EndReason|"decline") hook
+        self._decline_cb = decline_cb         # (call_id, notify_service) hook
         self._unsub_action = hass.bus.async_listen(
             NOTIFICATION_ACTION_EVENT, self._on_notification_action
         )
@@ -100,16 +100,20 @@ class MobileRinger:
 
     def list_mobile_devices(self) -> list[dict]:
         """MobileInfo dicts for every mobile_app entry with a live notify service."""
+        available = self.hass.services.async_services().get("notify", {})
+        return [m for m in self._phones() if m["notify_service"] in available]
+
+    def _phones(self) -> list[dict]:
+        """MobileInfo for every mobile_app entry, reachable or not. Linking an
+        app to its phone must not depend on when mobile_app's notify platform
+        finishes loading at startup."""
         dev_reg = dr.async_get(self.hass)
         area_reg = ar.async_get(self.hass)
-        available = self.hass.services.async_services().get("notify", {})
 
         out: list[dict] = []
         for entry in self.hass.config_entries.async_entries(MOBILE_APP_DOMAIN):
             device_name = entry.data.get("device_name") or entry.title
             service = f"mobile_app_{slugify(device_name)}"
-            if service not in available:
-                continue
             devices = dr.async_entries_for_config_entry(dev_reg, entry.entry_id)
             device = devices[0] if devices else None
             area_id = device.area_id if device else None
@@ -129,14 +133,17 @@ class MobileRinger:
         return out
 
     def find_companion_match(
-        self, user_id: str, ua_kind: str, ua_hint: str | None
+        self, user_id: str, ua_kind: str, ua_hint: str | None,
+        linked: str | None = None,
     ) -> dict | None:
         """The mobile_app device a registering companion endpoint IS (SPEC §4.4).
 
         Match by user + platform, narrowed by the UA hint (iphone/ipad vs the
-        registration's hardware model). Returns the MobileInfo only when the
-        match is UNIQUE — ambiguity (e.g. two iPads on one user, no hint)
-        falls back to an unlinked endpoint rather than guessing.
+        registration's hardware model). The phone the endpoint is already
+        linked to (`linked`, a device id) stays its phone while it still
+        qualifies. Otherwise the MobileInfo is returned only when the match is
+        UNIQUE — ambiguity (e.g. two iPads on one user, no hint) falls back to
+        an unlinked endpoint rather than guessing.
         """
         # iPads register with os_name "iPadOS" (not "iOS"); older iPhones may
         # report "iPhone OS" — accept the whole Apple family for companion-ios.
@@ -147,13 +154,16 @@ class MobileRinger:
         if not want_os:
             return None
         candidates = [
-            m for m in self.list_mobile_devices()
+            m for m in self._phones()
             if m["user_id"] == user_id and m["os_name"] in want_os
         ]
         if ua_hint and len(candidates) > 1:
             hinted = [m for m in candidates if m["model"].startswith(ua_hint)]
             if hinted:
                 candidates = hinted
+        for m in candidates:
+            if linked and m["device_id"] == linked:
+                return m
         # Same-class tie the coarse iphone/ipad hint can't split (e.g. two iPads
         # on one user): prefer the device whose companion is actually alive.
         # A removed/retired app leaves its mobile_app entities 'unavailable', so
@@ -203,7 +213,11 @@ class MobileRinger:
     # ring / clear (SPEC §7.1)
     # ------------------------------------------------------------------
 
-    async def async_send_ring(self, call: Call, caller_info: dict, services: list[str]) -> None:
+    async def async_send_ring(
+        self, call: Call, caller_info: dict, services: list[str]
+    ) -> set[str]:
+        """Push the ring to each phone; returns the services it couldn't reach.
+        Each phone's Decline action names that phone (SPEC §7.3)."""
         options = self._get_options()
         dashboard = options.get("answer_dashboard") or "/lovelace"
         ring_timeout = int(options.get("ring_timeout") or 30)
@@ -240,7 +254,6 @@ class MobileRinger:
                         # Android, which ignores unknown keys).
                         "activationMode": "foreground",
                     },
-                    {"action": f"{DECLINE_ACTION_PREFIX}{call.call_id}", "title": "Decline"},
                 ],
                 # iOS (ignored by Android)
                 "url": answer_uri,
@@ -257,11 +270,21 @@ class MobileRinger:
                 },
             },
         }
+        failed: set[str] = set()
         for service in services:
+            decline = {
+                "action": f"{DECLINE_ACTION_PREFIX}{call.call_id}|{service}",
+                "title": "Decline",
+            }
+            data = {**payload["data"], "actions": [*payload["data"]["actions"], decline]}
             try:
-                await self.hass.services.async_call("notify", service, payload, blocking=False)
+                await self.hass.services.async_call(
+                    "notify", service, {**payload, "data": data}, blocking=False
+                )
             except Exception:  # noqa: BLE001 — one dead phone must not kill the ring
                 _LOGGER.warning("ring push via notify.%s failed", service, exc_info=True)
+                failed.add(service)
+        return failed
 
     async def async_clear_ring(self, call_id: str, services: list[str]) -> None:
         payload = {
@@ -283,5 +306,8 @@ class MobileRinger:
         action = event.data.get("action") or ""
         if not action.startswith(DECLINE_ACTION_PREFIX):
             return
-        call_id = action[len(DECLINE_ACTION_PREFIX):]
-        self._end_call_cb(call_id)  # __init__.py maps this to a mobile-slot decline
+        # VCALL_DECLINE_<call_id>|<notify_service>; call ids are client-minted,
+        # so split at the LAST bar
+        call_id, _, service = action[len(DECLINE_ACTION_PREFIX):].rpartition("|")
+        if call_id and service:
+            self._decline_cb(call_id, service)
