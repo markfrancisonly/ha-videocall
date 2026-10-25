@@ -29,6 +29,8 @@ from .models import Call
 _LOGGER = logging.getLogger(__name__)
 
 MOBILE_APP_DOMAIN = "mobile_app"
+# iPads register as "iPadOS", older iPhones may report "iPhone OS"
+APPLE_OS = {"ios", "ipados", "iphone os"}
 NOTIFICATION_ACTION_EVENT = "mobile_app_notification_action"
 
 
@@ -145,10 +147,8 @@ class MobileRinger:
         UNIQUE — ambiguity (e.g. two iPads on one user, no hint) falls back to
         an unlinked endpoint rather than guessing.
         """
-        # iPads register with os_name "iPadOS" (not "iOS"); older iPhones may
-        # report "iPhone OS" — accept the whole Apple family for companion-ios.
         want_os = {
-            "companion-ios": {"ios", "ipados", "iphone os"},
+            "companion-ios": APPLE_OS,
             "companion-android": {"android"},
         }.get(ua_kind)
         if not want_os:
@@ -217,7 +217,8 @@ class MobileRinger:
         self, call: Call, caller_info: dict, services: list[str]
     ) -> set[str]:
         """Push the ring to each phone; returns the services it couldn't reach.
-        Each phone's Decline action names that phone (SPEC §7.3)."""
+        Each phone's Decline action names that phone (SPEC §7.3). Apple
+        devices get no Answer action (SPEC §7.1)."""
         options = self._get_options()
         dashboard = options.get("answer_dashboard") or "/lovelace"
         ring_timeout = int(options.get("ring_timeout") or 30)
@@ -243,19 +244,7 @@ class MobileRinger:
                 "timeout": ring_timeout,
                 "persistent": True,
                 "sticky": True,
-                "actions": [
-                    {
-                        "action": "URI",
-                        "title": "Answer",
-                        "uri": answer_uri,
-                        # iOS: default activationMode is background — the app
-                        # would never open. foreground is required for the
-                        # Answer tap to launch into the deep link (harmless on
-                        # Android, which ignores unknown keys).
-                        "activationMode": "foreground",
-                    },
-                ],
-                # iOS (ignored by Android)
+                # iOS: tapping the notification opens the app on the ring
                 "url": answer_uri,
                 # Regular (non-critical) alert with the default notification
                 # sound — no "Critical Alerts" permission required. Kept
@@ -270,13 +259,25 @@ class MobileRinger:
                 },
             },
         }
+        answer = {"action": "URI", "title": "Answer", "uri": answer_uri}
+        apple = {m["notify_service"]: m for m in self._phones() if m["os_name"] in APPLE_OS}
         failed: set[str] = set()
         for service in services:
             decline = {
                 "action": f"{DECLINE_ACTION_PREFIX}{call.call_id}|{service}",
                 "title": "Decline",
             }
-            data = {**payload["data"], "actions": [*payload["data"]["actions"], decline]}
+            if service in apple:
+                # iOS needs a tap in the app before the camera starts, so Answer
+                # could only open the app, and from a watch it can't even do that
+                kind = "iPad" if apple[service]["model"].startswith("ipad") else "iPhone"
+                data = {
+                    **payload["data"],
+                    "subtitle": f"Open on your {kind} to answer",
+                    "actions": [decline],
+                }
+            else:
+                data = {**payload["data"], "actions": [answer, decline]}
             try:
                 await self.hass.services.async_call(
                     "notify", service, {**payload, "data": data}, blocking=False
@@ -311,3 +312,4 @@ class MobileRinger:
         call_id, _, service = action[len(DECLINE_ACTION_PREFIX):].rpartition("|")
         if call_id and service:
             self._decline_cb(call_id, service)
+

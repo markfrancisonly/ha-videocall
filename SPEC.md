@@ -396,22 +396,25 @@ data:
   persistent: true
   sticky: true
   actions:
-    - action: "URI"
+    - action: "URI"                # Android only
       title: "Answer"
       uri: "{answer_dashboard}?vcall_answer={call_id}"
-      activationMode: foreground   # iOS: REQUIRED — default is background and
-                                   # the app never opens (Android ignores it)
     - action: "VCALL_DECLINE_{call_id}|{notify_service}"   # names the phone
       title: "Decline"
-  # iOS specifics (harmless on Android):
-  url: "{answer_dashboard}?vcall_answer={call_id}"
+  # iOS / iPadOS (ignored by Android):
+  subtitle: "Open on your iPhone to answer"   # "iPad" for iPads
+  url: "{answer_dashboard}?vcall_answer={call_id}"   # the notification tap
   push:
-    sound:
-      name: default
-      critical: 0
-      volume: 1.0
+    sound: default
     interruption-level: time-sensitive
 ```
+
+**No Answer action on Apple devices.** iOS needs a tap inside the app before
+the camera starts (§7.2), so an Answer action could only open the app, which
+tapping the notification already does. Worse, with an Apple Watch worn and the
+iPhone locked, iOS shows the push on the watch, where Answer cannot open the
+iPhone app at all: it only dismissed the notification on both devices. Apple
+devices therefore get Decline only, plus a subtitle saying where to answer.
 
 Clear (answered elsewhere / cancel / timeout): `message: clear_notification`,
 `data: {tag: "vcall-{call_id}"}` to the same services.
