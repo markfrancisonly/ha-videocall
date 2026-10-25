@@ -32,7 +32,7 @@
   } catch {}
 
   if (window.__VCALL_VENDOR__) return; // idempotent under double resource load
-  const VERSION = "0.14.9";
+  const VERSION = "0.14.10";
   window.__VCALL_VENDOR__ = { version: VERSION };
 
   const LS_CLIENT_ID = "vcall:client_id";
@@ -124,7 +124,8 @@
   // ==========================================================================
   // Shared roster→options builder (main-card dropdowns + button picker).
   // options: [{key, label, plainLabel, online, target, callable, dropInOk}]
-  // Ordering: online group first, each group alphabetical (SPEC §9.1).
+  // Only what can be called is listed. Ordering: online group first, each
+  // group alphabetical (SPEC §9.1).
   // ==========================================================================
   const rosterOptions = (core) => {
     const { persons = [], areas = [], endpoints = [], mobiles = [] } = core.rosterCache || {};
@@ -132,7 +133,7 @@
       (b.online ? 1 : 0) - (a.online ? 1 : 0) ||
       a.plainLabel.localeCompare(b.plainLabel));
 
-    return {
+    const opts = {
       // persons are ALWAYS callable: phones are push-reachable even with the
       // app closed; the online flag only marks live browser presence.
       persons: grouped(persons.map((p) => ({
@@ -168,7 +169,8 @@
             callable: e.online,
             dropInOk: e.online,
           })),
-        ...mobiles.map((m) => ({
+        // not the phone this card runs on: a phone can't call itself
+        ...mobiles.filter((m) => m.endpoint_id !== core.clientId).map((m) => ({
           key: `mobile:${m.notify_service}`,
           label: `${m.online ? "🟢" : "📱"} ${m.name}${m.area_name ? ` — ${m.area_name}` : ""}`,
           plainLabel: m.name,
@@ -184,6 +186,8 @@
         })),
       ]),
     };
+    for (const k of Object.keys(opts)) opts[k] = opts[k].filter((o) => o.callable);
+    return opts;
   };
 
   // ==========================================================================
