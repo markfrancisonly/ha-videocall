@@ -145,8 +145,8 @@ and are individually callable via target type `mobile`.
 companion endpoint is correlated to its `mobile_app` entry by `user_id` +
 platform (`os_name`) + UA hint (`iphone`/`ipad` vs the registration `model`).
 The link is stored as the videocall device's **via device** (the HA UI shows
-"Connected via Mark's iPhone"); HA drops it when the phone's device is
-removed. Precedence at registration: the phone the
+"Connected via Mark's iPhone"), so it survives restarts and HA drops it when
+the phone's device is removed. Precedence at registration: the phone the
 endpoint is already linked to, while it still matches (same user, platform
 and hint); else a UNIQUE match; a same-platform tie the coarse hint can't
 split (e.g. two iPads on one user) is broken toward the device that's
@@ -478,9 +478,11 @@ so the push always goes out.
 
 ## 8. Entities & services
 
-- Per endpoint device, created on its first registration:
+- Per endpoint device, created at startup for every known device and on
+  first registration of a new one:
   - `binary_sensor.<name>_online` (device_class connectivity, entity_category
-    diagnostic): on while the endpoint's registration is alive, off after.
+    diagnostic): on while the endpoint's registration is alive; off otherwise,
+    including after a restart until it registers again.
   - `sensor.<name>_call_state` (enum):
     - `ringing`: a call rings it and it hasn't answered or declined, or it
       placed a call nobody has answered yet. For a phone's app this includes

@@ -50,7 +50,7 @@ class Endpoint:
     name: str = ""
     browser_mod_id: str | None = None
     # the mobile_app device this endpoint is the companion app of (SPEC §4.4);
-    # also kept as the videocall device's via device
+    # kept as the videocall device's via device, so it survives restarts
     phone_device_id: str | None = None
     # DEVICE-OWNED drop-in consent (SPEC §5.4a): None = follow the global
     # default; [] = nobody; [user_id/name, …] = exclusively those callers

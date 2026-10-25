@@ -489,7 +489,7 @@ async def ws_register(hass: HomeAssistant, connection, msg: dict) -> None:
     )
 
     # device registry entry + browser_mod area adoption (SPEC §4.2)
-    await data.async_resolve_endpoint_device(endpoint)
+    await data.async_resolve_endpoint_device(endpoint, msg.get("name", ""))
 
     @callback
     def on_close() -> None:

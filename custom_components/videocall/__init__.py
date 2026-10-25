@@ -8,6 +8,7 @@ import re
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -167,7 +168,9 @@ class VideocallData:
 
     # --- endpoint device / area resolution (SPEC §4.2) ----------------------
 
-    async def async_resolve_endpoint_device(self, endpoint: Endpoint) -> None:
+    async def async_resolve_endpoint_device(
+        self, endpoint: Endpoint, requested_name: str = ""
+    ) -> None:
         dev_reg = dr.async_get(self.hass)
 
         suggested_area = None
@@ -175,7 +178,7 @@ class VideocallData:
 
         # 1) companion app → unify with its mobile_app device (SPEC §4.4):
         #    the phone HA already knows ("Mark's iPhone …") IS this endpoint.
-        #    The link is also kept as our device's via device.
+        #    The link is our device's via device, so it survives restarts.
         match = None
         if endpoint.ua_kind.startswith("companion") and endpoint.user_id:
             match = self.mobile.find_companion_match(
@@ -210,7 +213,9 @@ class VideocallData:
             "companion-ios": "iOS app",
             "companion-android": "Android app",
         }.get(endpoint.ua_kind) or endpoint.browser_hint or "browser"
-        name = endpoint.name or adopted_name or (
+        # derived afresh at every registration (endpoint.name is only the last
+        # display name), so a renamed phone's new name follows
+        name = requested_name or adopted_name or (
             f"{endpoint.user_name}'s {kind_label}"
             if endpoint.user_name
             else f"Videocall {kind_label}"
@@ -258,13 +263,27 @@ class VideocallData:
         endpoint.device_id = device.id
         endpoint.name = device.name_by_user or device.name or name
         endpoint.area_id = device.area_id
-        if device.area_id:
-            from homeassistant.helpers import area_registry as ar
+        endpoint.area_name = _area_name(self.hass, device.area_id)
 
-            area = ar.async_get(self.hass).async_get_area(device.area_id)
-            endpoint.area_name = area.name if area else None
-        else:
-            endpoint.area_name = None
+    def restore_endpoints(self) -> None:
+        """Every known endpoint, offline until it registers: its entities
+        exist from startup on, and an app keeps its phone link (SPEC §8)."""
+        dev_reg = dr.async_get(self.hass)
+        for device in dr.async_entries_for_config_entry(dev_reg, self.entry.entry_id):
+            client_id = next((i[1] for i in device.identifiers if i[0] == DOMAIN), None)
+            if client_id is None:
+                continue
+            self.endpoints.upsert(
+                Endpoint(
+                    client_id=client_id,
+                    ua_kind=device.model or "browser",
+                    name=device.name_by_user or device.name or "",
+                    device_id=device.id,
+                    area_id=device.area_id,
+                    area_name=_area_name(self.hass, device.area_id),
+                    phone_device_id=device.via_device_id,
+                )
+            )
 
     # --- mobile decline hook --------------------------------------------------
 
@@ -273,6 +292,11 @@ class VideocallData:
         call = self.calls.get(call_id)
         if call is not None:
             ws_api.async_decline_phone(self.hass, call, service)
+
+
+def _area_name(hass: HomeAssistant, area_id: str | None) -> str | None:
+    area = ar.async_get(hass).async_get_area(area_id) if area_id else None
+    return area.name if area else None
 
 
 async def async_setup(hass: HomeAssistant, config) -> bool:
@@ -316,6 +340,7 @@ def async_prune_offline_endpoints(hass: HomeAssistant) -> int:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = VideocallData(hass, entry)
     hass.data[DOMAIN] = data
+    data.restore_endpoints()
 
     ws_api.async_register_commands(hass)
     await async_register_frontend(hass)
@@ -361,11 +386,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 doorbell["poster"] = pic
         area_id = d.get("area_id")
         if area_id:
-            from homeassistant.helpers import area_registry as ar
-
-            area = ar.async_get(hass).async_get_area(area_id)
             doorbell["area_id"] = area_id
-            doorbell["area_name"] = area.name if area else None
+            doorbell["area_name"] = _area_name(hass, area_id)
         # target: exactly one of person / area / mobile / all
         if d.get("person"):
             target = {"type": "person", "id": d["person"]}
