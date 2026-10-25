@@ -65,6 +65,9 @@ class Endpoint:
     user_id: str | None = None
     user_name: str | None = None
     send_event: Callable[[dict], None] | None = None
+    # the websocket connection that registered it: client-asserted ids in
+    # later commands must come from this connection (SPEC §5.1)
+    connection: Any = None
     connected_at: float = 0.0
     # unique per REGISTRATION: lets a stale close callback (from a superseded
     # subscription) recognize that a newer registration owns the endpoint now
@@ -129,6 +132,7 @@ class EndpointRegistry:
         existing.user_id = endpoint.user_id
         existing.user_name = endpoint.user_name
         existing.send_event = endpoint.send_event
+        existing.connection = endpoint.connection
         existing.connected_at = endpoint.connected_at
         existing.reg_token = endpoint.reg_token
         return existing
@@ -137,6 +141,7 @@ class EndpointRegistry:
         ep = self._endpoints.get(client_id)
         if ep:
             ep.send_event = None
+            ep.connection = None
         return ep
 
     def remove(self, client_id: str) -> None:
@@ -158,6 +163,9 @@ class EndpointRegistry:
         ]
         if target_type == "endpoint":
             return [e for e in candidates if e.client_id == target_id]
+        if target_type == "mobile":
+            # the phone's open companion app rings in-app; the push goes out too
+            return [e for e in candidates if e.notify_service == target_id]
         if target_type == "area":
             return [e for e in candidates if e.area_id == target_id]
         if target_type == "person":

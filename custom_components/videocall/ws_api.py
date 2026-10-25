@@ -234,6 +234,7 @@ def async_end_call(hass: HomeAssistant, call: Call, reason: EndReason) -> None:
             if ep.call_id == call.call_id:
                 ep.call_id = None
             _push(ep, EVT_RING_CANCEL, {"call_id": call.call_id, "reason": reason.value})
+            async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, cid)
 
     for cid in (call.caller_id, call.callee_id):
         if not cid:
@@ -406,8 +407,13 @@ async def ws_register(hass: HomeAssistant, connection, msg: dict) -> None:
         connection.send_error(msg["id"], "endpoint_limit", "Too many endpoints")
         return
 
-    # a reload/reconnect supersedes the previous registration (SPEC §5.3)
+    # a reload/reconnect supersedes the previous registration (SPEC §5.3), but
+    # only for the same user: endpoint ids are visible to everyone in the roster
     prior = data.endpoints.get(client_id)
+    user_id = connection.user.id if connection.user else None
+    if prior and prior.user_id and prior.user_id != user_id:
+        connection.send_error(msg["id"], "client_id_taken", "Endpoint belongs to another user")
+        return
     if prior and prior.online:
         async_fail_endpoint_calls(hass, client_id, EndReason.SUPERSEDED)
 
@@ -429,6 +435,7 @@ async def ws_register(hass: HomeAssistant, connection, msg: dict) -> None:
             user_id=connection.user.id if connection.user else None,
             user_name=connection.user.name if connection.user else None,
             send_event=send_event,
+            connection=connection,
             connected_at=hass.loop.time(),
             reg_token=reg_token,
         )
@@ -530,7 +537,7 @@ def ws_roster(hass: HomeAssistant, connection, msg: dict) -> None:
 @websocket_api.async_response
 async def ws_invite(hass: HomeAssistant, connection, msg: dict) -> None:
     data = _data(hass)
-    caller = data.endpoints.get(msg["caller_client_id"])
+    caller = _own_endpoint(data, connection, msg["caller_client_id"])
     if caller is None or not caller.online:
         connection.send_error(msg["id"], "not_registered", "Register first")
         return
@@ -651,6 +658,16 @@ def _get_call_or_error(hass, connection, msg) -> Call | None:
     return call
 
 
+def _own_endpoint(data, connection, client_id: str | None) -> Endpoint | None:
+    """The endpoint only if THIS connection registered it (SPEC §5.1)."""
+    ep = data.endpoints.get(client_id) if client_id else None
+    return ep if ep is not None and ep.connection is connection else None
+
+
+def _owns_any(data, connection, client_ids) -> bool:
+    return any(_own_endpoint(data, connection, cid) for cid in client_ids)
+
+
 @websocket_api.websocket_command(
     {
         vol.Required("type"): WS_CANCEL,
@@ -661,6 +678,9 @@ def _get_call_or_error(hass, connection, msg) -> Call | None:
 def ws_cancel(hass: HomeAssistant, connection, msg: dict) -> None:
     call = _get_call_or_error(hass, connection, msg)
     if call is None:
+        return
+    if not _owns_any(_data(hass), connection, [call.caller_id]):
+        connection.send_error(msg["id"], "not_party", "Not the caller")
         return
     async_end_call(hass, call, EndReason.CALLER_CANCEL)
     connection.send_result(msg["id"])
@@ -679,12 +699,16 @@ def ws_accept(hass: HomeAssistant, connection, msg: dict) -> None:
     call = _get_call_or_error(hass, connection, msg)
     if call is None:
         return
-    callee = data.endpoints.get(msg["client_id"])
+    callee = _own_endpoint(data, connection, msg["client_id"])
     if callee is None or not callee.online:
         connection.send_error(msg["id"], "not_registered", "Register first")
         return
     if callee.in_call and callee.call_id != call.call_id:
         connection.send_error(msg["id"], "busy", "Endpoint busy in another call")
+        return
+    # a late joiner (cold-started from the push) must belong to a pushed phone's user
+    if callee.client_id not in call.ringing and callee.user_id not in call.mobile_user_ids:
+        connection.send_error(msg["id"], "not_invited", "Not a recipient of this call")
         return
     try:
         others = data.calls.accept(call, callee.client_id)
@@ -723,6 +747,7 @@ def ws_accept(hass: HomeAssistant, connection, msg: dict) -> None:
     caller = data.endpoints.get(call.caller_id)
     if caller:
         _push(caller, EVT_ACCEPTED, {"call_id": call.call_id, "peer": callee.info()})
+        async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, caller.client_id)
 
     async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, callee.client_id)
     # media/caller in the result let a late-joining endpoint (deep link, no
@@ -752,11 +777,20 @@ def ws_decline(hass: HomeAssistant, connection, msg: dict) -> None:
     call = _get_call_or_error(hass, connection, msg)
     if call is None:
         return
-    ep = data.endpoints.get(msg["client_id"])
-    if ep and ep.call_id == call.call_id:
+    ep = _own_endpoint(data, connection, msg["client_id"])
+    if ep is None:
+        connection.send_error(msg["id"], "not_registered", "Register first")
+        return
+    if ep.call_id == call.call_id:
         ep.call_id = None
         async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, ep.client_id)
-    if data.calls.decline(call, msg["client_id"]):
+    done = data.calls.decline(call, msg["client_id"])
+    # a phone's companion app declining in-app also declines that phone's push
+    if not done and ep.notify_service in call.mobile_notify_services:
+        done = data.calls.decline(call, None)
+        if not done:  # the call rings on elsewhere; clear this phone's notification
+            hass.async_create_task(data.mobile.async_clear_ring(call.call_id, [ep.notify_service]))
+    if done:
         async_end_call(hass, call, EndReason.DECLINED)
     connection.send_result(msg["id"])
 
@@ -776,7 +810,7 @@ def _relay(hass, connection, msg, event_type: str, key: str) -> None:
         return
     sender = msg["client_id"]
     peer_id = call.peer_of(sender)
-    if peer_id is None:
+    if peer_id is None or _own_endpoint(data, connection, sender) is None:
         connection.send_error(msg["id"], "not_party", "Not a party to this call")
         return
     peer = data.endpoints.get(peer_id)
@@ -848,6 +882,9 @@ def ws_candidate(hass: HomeAssistant, connection, msg: dict) -> None:
 def ws_hangup(hass: HomeAssistant, connection, msg: dict) -> None:
     call = _get_call_or_error(hass, connection, msg)
     if call is None:
+        return
+    if not _owns_any(_data(hass), connection, [call.caller_id, call.callee_id, *call.ringing]):
+        connection.send_error(msg["id"], "not_party", "Not a party to this call")
         return
     async_end_call(hass, call, EndReason.HANGUP)
     connection.send_result(msg["id"])

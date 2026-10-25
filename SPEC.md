@@ -192,11 +192,11 @@ caller-minted UUIDv4.
 
 | Command | Payload | Result / effect |
 |---|---|---|
-| `videocall/register` | `client_id`, `ua_kind`, `name?`, `browser_mod_id?` | Registers endpoint + **subscribes** it to events (the long-lived message id). Result: `{endpoint_id, name, area_id, area_name, ice_servers, ring_timeout, allow_drop_in}`. Re-register with same `client_id` on a new connection supersedes the old one. |
+| `videocall/register` | `client_id`, `ua_kind`, `name?`, `browser_mod_id?` | Registers endpoint + **subscribes** it to events (the long-lived message id). Result: `{endpoint_id, name, area_id, area_name, ice_servers, ring_timeout, allow_drop_in}`. Re-register with same `client_id` on a new connection supersedes the old one, for the same HA user only: a different user gets `client_id_taken` and the card mints a new id. |
 | `videocall/roster` | — | Result: `{endpoints: [EndpointInfo], mobiles: [MobileInfo], areas: [{area_id, name, online_count, push_count}], persons: [{entity_id, name, user_id, online}], config: {ice_servers, ring_timeout, allow_drop_in}}`. `persons[].online` reflects browser presence only — persons and mobiles are ALWAYS callable via push (§4.4). `config` rides on every roster result AND push — it is how entry options (esp. a TURN server) reach clients, since the register result is consumed by the subscription helper. |
-| `videocall/invite` | `call_id`, `target: {type: endpoint\|area\|person\|mobile\|all, id?}`, `media: video\|audio`, `drop_in?: bool` | Creates call in state `ringing`; pushes `ring` to resolved endpoints; pushes mobile notifications (person → their phones; mobile → that phone; area → phones in the area; all → every phone); arms ring timeout. `drop_in: true` → `ring` carries `drop_in` and receiving browser endpoints auto-accept (§5.5); rejected with `drop_in_disabled` if the option is off. Errors: `busy_here` (a target endpoint is in a call — still rings idle ones), `no_targets`, `caller_busy`. |
+| `videocall/invite` | `call_id`, `target: {type: endpoint\|area\|person\|mobile\|all, id?}`, `media: video\|audio`, `drop_in?: bool` | Creates call in state `ringing`; pushes `ring` to resolved endpoints; pushes mobile notifications (person → their phones; mobile → that phone, whose open companion app also rings in-app; area → phones in the area; all → every phone); arms ring timeout. `drop_in: true` → `ring` carries `drop_in` and receiving browser endpoints auto-accept (§5.5); rejected with `drop_in_disabled` if the option is off. Errors: `busy_here` (a target endpoint is in a call — still rings idle ones), `no_targets`, `caller_busy`. |
 | `videocall/cancel` | `call_id` | Caller aborts ringing → `ring_cancel` to all ringing endpoints + mobile clear. |
-| `videocall/accept` | `call_id`, `client_id` | First accept wins (`call.state=connecting`); others get `ring_cancel`; mobile notifications cleared; caller gets `accepted {peer: EndpointInfo}`. Result: `{caller: EndpointInfo, media}` — enough for a **late joiner** to build its session without ever having received `ring`. An endpoint NOT in the ring set may accept iff the call pushed to mobile (cold-start deep-link join, §7.2). Accept on an answered/ended call → `too_late`/`unknown_call`; endpoint busy in another call → `busy`. |
+| `videocall/accept` | `call_id`, `client_id` | First accept wins (`call.state=connecting`); others get `ring_cancel`; mobile notifications cleared; caller gets `accepted {peer: EndpointInfo}`. Result: `{caller: EndpointInfo, media}` — enough for a **late joiner** to build its session without ever having received `ring`. An endpoint NOT in the ring set may accept iff the call pushed to a phone of the endpoint's own user (cold-start deep-link join, §7.2); otherwise `not_invited`. Accept on an answered/ended call → `too_late`/`unknown_call`; endpoint busy in another call → `busy`. |
 | `videocall/decline` | `call_id`, `reason?` | Marks that endpoint declined. When **all** rung targets have declined and no mobile push is pending → call ends, caller gets `hangup {reason: declined}`. |
 | `videocall/offer` | `call_id`, `sdp` | Caller→callee relay (only in `connecting`). |
 | `videocall/answer` | `call_id`, `sdp` | Callee→caller relay; server sets `call.state=active`, stamps `answered_at`, fires `videocall_answered` bus event. |
@@ -215,6 +215,14 @@ caller-minted UUIDv4.
 - `roster {…same shape as videocall/roster result}` (debounced 1 s)
 
 `EndpointInfo = {endpoint_id, client_id, name, area_id, area_name, ua_kind, user_id, user_name, online, in_call}`
+
+**Ownership.** Endpoint ids are public (every roster carries them), so the
+server never trusts one on its own: `caller_client_id` / `client_id` must name
+an endpoint registered on the SAME websocket connection (`not_registered`
+otherwise), `cancel` must come from the caller's connection and `hangup` from
+the caller's, the callee's or a still-ringing endpoint's (`not_party`).
+Ownership is in memory: after a restart the first registration of an id
+claims it.
 
 ### 5.3 Call state machine (server-authoritative)
 
@@ -237,7 +245,10 @@ Rules:
   ringing calls; accepting one makes the endpoint busy, and the server then
   auto-cancels the other with `superseded`.
 - **Supersede:** re-`register` of the same `client_id` (page reload) fails any
-  call the old registration was party to (`peer_disconnected`).
+  call the old registration was party to (`peer_disconnected`). The events
+  that say so went to a dead connection, so the client ends its own session
+  before re-registering (an outgoing call ends as `error: reconnected`, so the card's one auto-redial still applies); it also ends a `ringing_in` session itself
+  `ring_timeout + 5` s after the ring, in case a `ring_cancel` was lost.
 - All transitions logged at DEBUG; ended calls kept in a bounded deque (50) for
   the `sensor.videocall_last_call` attributes.
 
@@ -445,7 +456,9 @@ mechanisms cooperate, in order of authority:
 Companion fires HA event `mobile_app_notification_action` with
 `action == "VCALL_DECLINE_<call_id>"`; `mobile.py` listener maps it to a
 decline (counts toward the all-declined check with one virtual "mobile" slot
-per person).
+per person). A companion app declining in-app also uses up its own phone's
+slot and clears that phone's notification, so a call to one phone ends when that phone declines. The card targets a
+phone as `mobile` even while its app looks open, so the push always goes out.
 
 ## 8. Entities & services
 

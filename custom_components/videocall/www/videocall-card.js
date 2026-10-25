@@ -32,7 +32,7 @@
   } catch {}
 
   if (window.__VCALL_VENDOR__) return; // idempotent under double resource load
-  const VERSION = "0.14.5";
+  const VERSION = "0.14.9";
   window.__VCALL_VENDOR__ = { version: VERSION };
 
   const LS_CLIENT_ID = "vcall:client_id";
@@ -173,10 +173,9 @@
           label: `${m.online ? "🟢" : "📱"} ${m.name}${m.area_name ? ` — ${m.area_name}` : ""}`,
           plainLabel: m.name,
           online: !!m.online,
-          // app open → ring in-app via its endpoint; closed → push
-          target: m.online && m.endpoint_id
-            ? { type: "endpoint", id: m.endpoint_id }
-            : { type: "mobile", id: m.notify_service },
+          // always push (an iOS app can look online while suspended); the
+          // server also rings the app in-app when it is open
+          target: { type: "mobile", id: m.notify_service },
           callable: true,
           // an OPEN companion app is a live endpoint and CAN auto-answer —
           // wall-mounted tablets/kiosks are the primary drop-in use case.
@@ -471,7 +470,20 @@
           throw e;
         }
       }
-      this._emit("localstream", this.localStream);
+      this._adoptStream();
+    }
+
+    /** Capture can finish after a hangup (the camera would stay on) or after
+     *  mute/video-off was pressed (the new tracks would ignore it). */
+    _adoptStream() {
+      if (this.state === "ended") {
+        this.localStream?.getTracks().forEach((t) => t.stop());
+        this.localStream = null;
+        throw new Error("call ended during media startup");
+      }
+      this.localStream?.getAudioTracks().forEach((t) => (t.enabled = this.micEnabled));
+      this.localStream?.getVideoTracks().forEach((t) => (t.enabled = this.camEnabled));
+      this._emit("localstream", this.localStream || new MediaStream());
     }
 
     /** Poor-man's flip camera: cycle the OUTGOING video to the next camera.
@@ -631,7 +643,7 @@
         this.micEnabled = false;
         this._emit("toast", "Microphone unavailable — listen only");
       }
-      this._emit("localstream", this.localStream || new MediaStream());
+      this._adoptStream();
     }
 
     /** Build the media leg to go2rtc: mic up (backchannel) + door video/audio
@@ -878,6 +890,7 @@
       this._teardown("hangup");
     }
     async fail(reason) {
+      if (this.state === "ended") return;
       // ICE-failure triage: log what candidate types each side produced. No
       // relay candidates + srflx-only pairing failure = NAT needs a TURN
       // server (Video Call options → ICE servers). SPEC §12 troubleshooting.
@@ -975,7 +988,10 @@
         const hc = await (window.hassConnection || topWindow.hassConnection);
         if (!hc?.conn) throw new Error("no hassConnection");
         this.conn = hc.conn;
-        this.conn.addEventListener("ready", () => this._register().catch(noop)); // reconnects
+        this.conn.addEventListener("ready", () => { // reconnects
+          this._endOrphanedSession();
+          this._register().catch(noop);
+        });
         this.conn.addEventListener("disconnected", () => {
           this.registered = false;
           this._emit("status", "reconnecting…");
@@ -1007,6 +1023,16 @@
       return await this.conn.sendMessagePromise({ type, ...payload });
     }
 
+    /** After a reconnect or a deliberate re-register the server has already
+     *  ended this page's ring or call (disconnect/supersede, SPEC §5.3) and its
+     *  ring_cancel/hangup went out while we were offline: end the local session
+     *  to match. An outgoing call ends as an error so it keeps its one
+     *  auto-redial. Not for invite()'s self-heal, whose session is brand new. */
+    _endOrphanedSession() {
+      const s = this.session;
+      if (s && s.state !== "ended") s.onRemoteEnd(s.role === "caller" ? "error: reconnected" : "reconnected");
+    }
+
     async _register() {
       // ONE live registration at a time: tear down the previous subscription
       // first, and let OUR 'ready' listener be the only re-register path
@@ -1016,7 +1042,7 @@
       try { await this._unsub?.(); } catch {}
       this._unsub = null;
       const browserModId = safeStorage.get("browser_mod-browser-id") || undefined;
-      this._unsub = await this.conn.subscribeMessage(
+      const subscribe = () => this.conn.subscribeMessage(
         (evt) => this._onEvent(evt),
         {
           type: "videocall/register",
@@ -1029,6 +1055,15 @@
         },
         { resubscribe: false },
       );
+      try {
+        this._unsub = await subscribe();
+      } catch (err) {
+        if (err?.code !== "client_id_taken") throw err;
+        // the id belongs to another HA user (account switch in this browser)
+        this.clientId = uuid();
+        safeStorage.set(LS_CLIENT_ID, this.clientId);
+        this._unsub = await subscribe();
+      }
       // TODO(M1): capture the register RESULT (ice_servers/ring_timeout/
       // allow_drop_in) instead of relying on defaults — split
       // register/subscribe or read the command result from the collection.
@@ -1050,6 +1085,7 @@
         if (this.dropInAllow === null) localStorage.removeItem("vcall:dropin_allow");
         else safeStorage.set("vcall:dropin_allow", JSON.stringify(this.dropInAllow));
       } catch {}
+      this._endOrphanedSession();
       await this._register().catch(noop); // declare the new consent to the server
     }
 
@@ -1094,6 +1130,11 @@
             this.session.accept();
           } else {
             VideocallOverlay.instance().showRing(this.session);
+            // backstop for a lost ring_cancel: the server times rings out first
+            const ringing = this.session;
+            setTimeout(() => {
+              if (ringing.state === "ringing_in") ringing.onRemoteEnd("timeout");
+            }, (this.ringTimeout + 5) * 1000);
           }
           break;
         }
@@ -1287,7 +1328,8 @@ button{border:0;border-radius:50%;cursor:pointer;color:#fff;display:flex;flex-di
 .ctrl.hang{background:#d33}
 video{background:#000;border-radius:12px}
 #remote{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;border-radius:0}
-#local{position:absolute;right:calc(16px + env(safe-area-inset-right,0px));bottom:calc(130px + env(safe-area-inset-bottom,0px));width:26vw;max-width:240px;height:auto;object-fit:cover;z-index:2;border-radius:14px;box-shadow:0 4px 18px rgba(0,0,0,.5);cursor:grab;touch-action:none}
+#localbox{position:absolute;right:calc(16px + env(safe-area-inset-right,0px));bottom:calc(130px + env(safe-area-inset-bottom,0px));width:26vw;max-width:240px;aspect-ratio:3/4;overflow:hidden;z-index:2;border-radius:14px;box-shadow:0 4px 18px rgba(0,0,0,.5);cursor:grab;touch-action:none}
+#local{display:block;width:100%;height:100%;object-fit:cover}
 .callui{display:none;position:absolute;inset:0}
 .callui .bar{position:absolute;bottom:calc(26px + env(safe-area-inset-bottom,0px));left:0;right:0;display:flex;justify-content:center;gap:22px;z-index:3;transition:opacity .3s,transform .3s}
 .dur{position:absolute;top:calc(18px + env(safe-area-inset-top,0px));left:0;right:0;text-align:center;opacity:.85;z-index:3;font-size:17px;transition:opacity .3s}
@@ -1301,7 +1343,7 @@ video{background:#000;border-radius:12px}
    is turned OFF while minimized (privacy + bandwidth) and restored after. */
 :host(.mini){inset:auto;right:calc(14px + env(safe-area-inset-right,0px));bottom:calc(14px + env(safe-area-inset-bottom,0px));width:200px;height:140px;border-radius:16px;overflow:hidden;box-shadow:0 6px 24px rgba(0,0,0,.55);cursor:grab;touch-action:none}
 :host(.mini) .bg{display:none}
-:host(.mini) .bar,:host(.mini) .dur,:host(.mini) #local{display:none!important}
+:host(.mini) .bar,:host(.mini) .dur,:host(.mini) #localbox{display:none!important}
 :host(.mini) #remote{object-fit:cover}
 .hidden{display:none!important}
 </style>
@@ -1326,7 +1368,7 @@ video{background:#000;border-radius:12px}
 </div>
 <div class="callui" id="callui">
   <video id="remote" autoplay playsinline></video>
-  <video id="local" autoplay playsinline muted title="Tap to flip camera · drag to move"></video>
+  <div id="localbox" title="Tap to flip camera · drag to move"><video id="local" autoplay playsinline muted></video></div>
   <!-- dedicated remote-audio sink: a <video> element plays WebRTC audio
        unreliably (esp. iOS); the door's audio is routed here for doorbell
        calls while #remote stays muted (video only) to avoid double audio -->
@@ -1370,7 +1412,24 @@ video{background:#000;border-radius:12px}
       // self-view PiP: a clean TAP flips the camera (poor-man's reverse cam);
       // a DRAG moves the window. Movement past a small slop = drag (suppress the
       // flip); pointer-capture keeps the drag smooth if the finger leaves the box.
-      const lv = $("local");
+      const lv = $("localbox"), lvid = $("local");
+      // TEMPORARY WORKAROUND, iOS app only (seen on iOS 27 in the companion
+      // app): WebKit fits a rotated camera stream by its unrotated landscape
+      // frame and rotates it afterwards, ignoring object-fit, so a portrait
+      // self-view draws at short/long scale inside its box (same family as
+      // WebKit bug 229792). Scaling the video by long/short cancels it exactly.
+      // Remove when flipping cameras on an iPhone without this scale shows a
+      // full-size picture. Android and desktop never take this path.
+      const iosRotatedFix = uaKind() === "companion-ios";
+      // the box takes the current camera's shape (a flip can change it)
+      const fitPip = () => {
+        const vw = lvid.videoWidth, vh = lvid.videoHeight;
+        if (!vw || !vh) return;
+        lv.style.aspectRatio = `${vw} / ${vh}`;
+        lvid.style.transform = iosRotatedFix && vh > vw ? `scale(${vh / vw})` : "";
+      };
+      lvid.addEventListener("loadedmetadata", fitPip);
+      lvid.addEventListener("resize", fitPip);
       let dsx, dsy, dox, doy, dMoved = false, dActive = false;
       lv.addEventListener("pointerdown", (e) => {
         if (this.classList.contains("mini")) return;
@@ -1591,7 +1650,7 @@ video{background:#000;border-radius:12px}
       $("rvoice")._vcTrackId = null;
       // reset the self-view PiP to its default corner each call (its drag offset
       // otherwise persists across calls and its clamp goes stale on rotate)
-      const _lv = $("local");
+      const _lv = $("localbox");
       _lv.style.left = _lv.style.top = _lv.style.right = _lv.style.bottom = _lv.style.cursor = "";
       const subs = [];
 
@@ -1599,7 +1658,7 @@ video{background:#000;border-radius:12px}
       // or audio-only means NO box at all, just the remote video.
       const refreshLocalPip = () => {
         const hasVideo = !!session.localStream?.getVideoTracks().some((t) => t.readyState === "live");
-        $("local").classList.toggle("hidden", !hasVideo || !session.camEnabled);
+        $("localbox").classList.toggle("hidden", !hasVideo || !session.camEnabled);
       };
       const onState = (e) => {
         const s = e.detail;
