@@ -420,7 +420,7 @@ Clear (answered elsewhere / cancel / timeout): `message: clear_notification`,
 backgrounded or force-quit iOS app keeps a zombie websocket for the whole
 heartbeat window, so "online" can't be trusted to deliver a ring. An open app
 rings in-app as well; the shared tag clears the notification when the call is
-answered, declined or ends.
+answered, declined or ends. The caller's own phone is never pushed.
 
 Each pushed phone is tracked in the call (`phones`, by notify service) and
 stays **ringing** until it declines, the call is answered, or the call ends.

@@ -189,7 +189,7 @@ def _resolve_ring(
 ):
     """Resolve a target to (online endpoints, phones to push, person_user_id).
     Shared by the browser invite (§5.1) and the doorbell ring (§14) so both
-    fan out identically."""
+    fan out identically. A caller's own phone is never pushed."""
     data = _data(hass)
     mobiles = {m["notify_service"]: m for m in data.mobile.list_mobile_devices()}
 
@@ -208,6 +208,8 @@ def _resolve_ring(
         if s in mobiles else Phone(s)  # a person_notify_map service that isn't a phone
         for s in dict.fromkeys(services)
     ]
+    if caller and caller.phone_device_id:
+        phones = [p for p in phones if p.device_id != caller.phone_device_id]
 
     person_user_id = None
     if target_type == "person":
