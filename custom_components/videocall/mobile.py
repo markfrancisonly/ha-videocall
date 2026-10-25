@@ -21,6 +21,7 @@ from homeassistant.util import slugify
 from .const import (
     DECLINE_ACTION_PREFIX,
     DEEP_LINK_PARAM,
+    MISSED_CHANNEL,
     NOTIF_CHANNEL,
     NOTIF_TAG_PREFIX,
 )
@@ -224,17 +225,10 @@ class MobileRinger:
         ring_timeout = int(options.get("ring_timeout") or 30)
         answer_uri = f"{dashboard}?{DEEP_LINK_PARAM}={call.call_id}"
         icon = "📹" if call.media == "video" else "📞"
-        # Same identity format as the in-app ring UI: "Mark (browser fc9b61)" —
-        # the USER calling, with the endpoint for disambiguation (SPEC §9.3).
-        name = caller_info.get("name") or (caller_info.get("client_id") or "")[:6]
-        user = caller_info.get("user_name")
-        caller_label = (
-            f"{user} ({name})" if user and user != name else (name or "Home Assistant")
-        )
 
         payload = {
             "title": f"{icon} Incoming {call.media} call",
-            "message": f"{caller_label} is calling",
+            "message": f"{_caller_label(caller_info)} is calling",
             "data": {
                 "tag": f"{NOTIF_TAG_PREFIX}{call.call_id}",
                 "channel": NOTIF_CHANNEL,
@@ -287,6 +281,30 @@ class MobileRinger:
                 failed.add(service)
         return failed
 
+    async def async_send_missed(
+        self, call: Call, caller_info: dict, services: list[str]
+    ) -> None:
+        """Replace an unanswered ring with a quiet missed-call note (same tag):
+        no sound, no wake, no watch buzz, no actions (SPEC §7.4)."""
+        dashboard = self._get_options().get("answer_dashboard") or "/lovelace"
+        payload = {
+            "title": f"Missed {call.media} call",
+            "message": f"{_caller_label(caller_info)} called",
+            "data": {
+                "tag": f"{NOTIF_TAG_PREFIX}{call.call_id}",
+                "channel": MISSED_CHANNEL,
+                "importance": "low",
+                "clickAction": dashboard,
+                "url": dashboard,
+                "push": {"interruption-level": "passive"},
+            },
+        }
+        for service in services:
+            try:
+                await self.hass.services.async_call("notify", service, payload, blocking=False)
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("missed-call push via notify.%s failed", service)
+
     async def async_clear_ring(self, call_id: str, services: list[str]) -> None:
         payload = {
             "message": "clear_notification",
@@ -313,3 +331,10 @@ class MobileRinger:
         if call_id and service:
             self._decline_cb(call_id, service)
 
+
+def _caller_label(caller_info: dict) -> str:
+    """Same identity format as the in-app ring UI: "Mark (browser fc9b61)",
+    the USER calling, with the endpoint for disambiguation (SPEC §9.3)."""
+    name = caller_info.get("name") or (caller_info.get("client_id") or "")[:6]
+    user = caller_info.get("user_name")
+    return f"{user} ({name})" if user and user != name else (name or "Home Assistant")

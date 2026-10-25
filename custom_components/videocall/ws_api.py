@@ -276,10 +276,16 @@ def async_end_call(hass: HomeAssistant, call: Call, reason: EndReason) -> None:
             ep.call_id = None
             _push(ep, EVT_HANGUP, {"call_id": call.call_id, "reason": reason.value})
 
-    if call.phones and (was_ringing or reason is EndReason.CALLER_CANCEL):
-        hass.async_create_task(
-            data.mobile.async_clear_ring(call.call_id, list(call.phones))
-        )
+    # phones still ringing when nobody answered get a missed-call note (SPEC
+    # §7.4); otherwise they just lose the ring. Declined phones cleared already.
+    unanswered = was_ringing and reason in (EndReason.TIMEOUT, EndReason.CALLER_CANCEL)
+    still = [s for s in call.phones if was_ringing and s in call.ringing_phones]
+    if still and unanswered:
+        caller = data.endpoints.get(call.caller_id)
+        caller_info = caller.info() if caller else (call.caller_info or {})
+        hass.async_create_task(data.mobile.async_send_missed(call, caller_info, still))
+    elif still:
+        hass.async_create_task(data.mobile.async_clear_ring(call.call_id, still))
     _async_refresh(hass, call)
 
     hass.bus.async_fire(
@@ -317,11 +323,10 @@ def async_decline_phone(hass: HomeAssistant, call: Call, service: str) -> None:
         if ep.call_id == call.call_id:
             ep.call_id = None
         _push(ep, EVT_RING_CANCEL, {"call_id": call.call_id, "reason": EndReason.DECLINED.value})
+    hass.async_create_task(data.mobile.async_clear_ring(call.call_id, [service]))
     if call.all_declined():
         async_end_call(hass, call, EndReason.DECLINED)
         return
-    # the call rings on elsewhere; take it off this phone's screen
-    hass.async_create_task(data.mobile.async_clear_ring(call.call_id, [service]))
     _async_refresh(hass, call)
 
 
@@ -752,6 +757,7 @@ def ws_accept(hass: HomeAssistant, connection, msg: dict) -> None:
     if callee.in_call and callee.call_id != call.call_id:
         connection.send_error(msg["id"], "busy", "Endpoint busy in another call")
         return
+    ringing_phones = list(call.ringing_phones)
     try:
         others = data.calls.accept(call, callee)
     except InvalidTransition as err:
@@ -786,10 +792,8 @@ def ws_accept(hass: HomeAssistant, connection, msg: dict) -> None:
                   {"call_id": call.call_id, "reason": "answered_elsewhere"})
             async_dispatcher_send(hass, SIGNAL_ENDPOINT_UPDATE, cid)
 
-    if call.phones:
-        hass.async_create_task(
-            data.mobile.async_clear_ring(call.call_id, list(call.phones))
-        )
+    if ringing_phones:
+        hass.async_create_task(data.mobile.async_clear_ring(call.call_id, ringing_phones))
 
     caller = data.endpoints.get(call.caller_id)
     if caller:

@@ -69,6 +69,7 @@ BUS_EVT_ENDED = "videocall_ended"
 NOTIF_TAG_PREFIX = "vcall-"                  # tag = vcall-<call_id>
 DECLINE_ACTION_PREFIX = "VCALL_DECLINE_"     # VCALL_DECLINE_<call_id>|<notify_service>
 NOTIF_CHANNEL = "Video Call"
+MISSED_CHANNEL = "Missed call"               # Android: its own, quiet channel
 DEEP_LINK_PARAM = "vcall_answer"
 
 # --- limits (SPEC.md §11) -----------------------------------------------------

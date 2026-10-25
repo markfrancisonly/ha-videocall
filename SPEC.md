@@ -244,8 +244,8 @@ Rules:
 - **One active/pending call per endpoint** (caller or callee). `invite` while
   busy → `caller_busy`; a rung endpoint that is busy is skipped.
 - **Ring timeout** (default 30 s, options): server-side `async_call_later` →
-  `ring_cancel(timeout)` to ringers, `hangup(timeout)` to caller, mobile clear,
-  bus event `videocall_ended {reason: missed}`.
+  `ring_cancel(timeout)` to ringers, `hangup(timeout)` to caller, a missed-call
+  note to phones still ringing (§7.4), bus event `videocall_ended {reason: missed}`.
 - **Glare:** roles are fixed (inviter = offerer) so classic WebRTC glare cannot
   occur. Two endpoints inviting each other simultaneously simply produce two
   ringing calls; accepting one makes the endpoint busy, and the server then
@@ -478,6 +478,27 @@ and its app's accept gets `not_invited`. If no endpoint and no phone is left
 ringing the call ends as declined; otherwise only that phone's notification is
 cleared. The card targets a phone as `mobile` even while its app looks open,
 so the push always goes out.
+
+### 7.4 Missed call
+When a ringing call ends because nobody answered (`timeout`) or the caller hung
+up first (`caller_cancel`), every phone still ringing gets its ring
+notification replaced (same tag) by a quiet note:
+
+```yaml
+title: "Missed video call"                       # or audio
+message: "{caller_user} ({caller_endpoint}) called"
+data:
+  tag: "vcall-{call_id}"
+  channel: "Missed call"       # Android: its own channel, so it doesn't ring
+  importance: low
+  clickAction: "{answer_dashboard}"
+  url: "{answer_dashboard}"
+  push:
+    interruption-level: passive   # iOS: no sound, no wake, no watch buzz
+```
+
+Phones that declined, and calls answered on another device, get no note; any
+other ending just clears the ring.
 
 ## 8. Entities & services
 
