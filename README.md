@@ -57,8 +57,8 @@ Or manually add the custom repository:
 
 ### Manual Installation
 
-1. Download the [latest release](https://github.com/markfrancisonly/ha-videocall/releases)
-2. Copy the contents into `custom_components/ha-videocall/` inside your HA config directory
+1. Download `videocall.zip` from the [latest release](https://github.com/markfrancisonly/ha-videocall/releases)
+2. Extract it into `custom_components/videocall/` inside your HA config directory
 3. Restart Home Assistant
 
 ---
